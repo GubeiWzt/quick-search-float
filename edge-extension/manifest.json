@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "快捷搜索后台加载器",
+  "version": "1.0.0",
+  "description": "接收本机快捷搜索请求，在 Edge 后台标签页加载完成后通知悬浮窗。",
+  "minimum_chrome_version": "116",
+  "permissions": ["alarms"],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "action": {
+    "default_title": "快捷搜索后台加载器"
+  }
+}
