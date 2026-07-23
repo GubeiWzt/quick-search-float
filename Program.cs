@@ -34,6 +34,7 @@ namespace QuickSearchFloat
         [STAThread]
         public static int Main(string[] args)
         {
+            ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
             string appDirectory = AppDomain.CurrentDomain.BaseDirectory;
             SearchSettings settings = SearchSettings.Load(Path.Combine(appDirectory, "settings.ini"));
 
@@ -56,9 +57,13 @@ namespace QuickSearchFloat
                 app.ShutdownMode = ShutdownMode.OnExplicitShutdown;
                 bool appearancePreview = args.Any(arg => string.Equals(arg, "--appearance-preview",
                     StringComparison.OrdinalIgnoreCase));
-                bool preview = appearancePreview || args.Any(arg => string.Equals(arg, "--ui-preview",
+                bool resultsPreview = args.Any(arg => string.Equals(arg, "--results-preview",
                     StringComparison.OrdinalIgnoreCase));
-                MainWindow window = new MainWindow(settings, preview, appearancePreview);
+                bool preview = appearancePreview || resultsPreview ||
+                    args.Any(arg => string.Equals(arg, "--ui-preview",
+                        StringComparison.OrdinalIgnoreCase));
+                MainWindow window = new MainWindow(
+                    settings, preview, appearancePreview, resultsPreview);
                 app.Run(window);
             }
             return 0;
@@ -155,6 +160,15 @@ namespace QuickSearchFloat
                 if (SearchHelper.MoveIndex(0, 3, 120) != 2 ||
                     SearchHelper.MoveIndex(2, 3, -120) != 0)
                     throw new InvalidOperationException("滚轮切换搜索引擎检查失败。");
+                if (!SearchHelper.SupportsInlineResults("https://www.google.com/search?q=test") ||
+                    !SearchHelper.SupportsInlineResults("https://www.bing.com/search?q=test") ||
+                    !SearchHelper.SupportsInlineResults("https://www.baidu.com/s?wd=test") ||
+                    SearchHelper.SupportsInlineResults("https://example.test/search?q=test"))
+                    throw new InvalidOperationException("内嵌结果搜索引擎识别失败。");
+                if (SearchHelper.BuildFaviconUrl("https://www.example.test/path?q=1") !=
+                        "https://www.example.test/favicon.ico" ||
+                    SearchHelper.BuildFaviconUrl("not-a-url") != null)
+                    throw new InvalidOperationException("网站图标地址生成失败。");
 
                 string browser = SearchHelper.GetDefaultBrowserExecutable();
                 if (string.IsNullOrWhiteSpace(browser) || !File.Exists(browser))
@@ -165,9 +179,12 @@ namespace QuickSearchFloat
                 string workerPath = Path.Combine(extensionDirectory, "service-worker.js");
                 if (!File.Exists(manifestPath) || !File.Exists(workerPath))
                     throw new InvalidOperationException("Edge 扩展文件不完整。");
-                if (File.ReadAllText(manifestPath, Encoding.UTF8).IndexOf("\"manifest_version\": 3",
-                    StringComparison.Ordinal) < 0)
+                string manifest = File.ReadAllText(manifestPath, Encoding.UTF8);
+                if (manifest.IndexOf("\"manifest_version\": 3", StringComparison.Ordinal) < 0)
                     throw new InvalidOperationException("Edge 扩展清单不是 Manifest V3。");
+                if (manifest.IndexOf("\"scripting\"", StringComparison.Ordinal) < 0 ||
+                    manifest.IndexOf("\"host_permissions\"", StringComparison.Ordinal) < 0)
+                    throw new InvalidOperationException("Edge 扩展缺少结果提取权限。");
 
                 RunBridgeProtocolSelfTest().GetAwaiter().GetResult();
 
@@ -198,7 +215,24 @@ namespace QuickSearchFloat
             try
             {
                 using (EdgeExtensionBridge bridge = new EdgeExtensionBridge(EdgeExtensionBridge.DefaultPort))
+                using (ManualResetEventSlim moreCompleted = new ManualResetEventSlim(false))
                 {
+                    int resultCount = 0;
+                    int aiResultCount = 0;
+                    int batchCount = 0;
+                    bool hasMore = false;
+                    bridge.ResultReceived += delegate(string eventRequestId, InlineSearchResult result)
+                    {
+                        Interlocked.Increment(ref resultCount);
+                        if (result.Kind == "ai")
+                            Interlocked.Increment(ref aiResultCount);
+                    };
+                    bridge.BatchCompleted += delegate(string eventRequestId, bool more)
+                    {
+                        hasMore = more;
+                        if (Interlocked.Increment(ref batchCount) >= 2)
+                            moreCompleted.Set();
+                    };
                     bridge.Start();
                     DateTime deadline = DateTime.UtcNow.AddSeconds(35);
                     while (!bridge.IsConnected && DateTime.UtcNow < deadline)
@@ -209,9 +243,23 @@ namespace QuickSearchFloat
                     SearchEngine engine = settings.Engines.First(e => e.Name == settings.SelectedName);
                     string url = SearchHelper.BuildSearchUrl("QuickSearchFloat 后台加载测试", engine.Template);
                     string requestId = bridge.SearchAsync(url, 30).GetAwaiter().GetResult();
+                    if (SearchHelper.SupportsInlineResults(url) && resultCount < 1)
+                        throw new InvalidOperationException("未提取到内嵌搜索结果，请重新加载 Edge 扩展。");
+                    int initialResultCount = resultCount;
+                    if (hasMore)
+                    {
+                        bridge.LoadMoreAsync(requestId).GetAwaiter().GetResult();
+                        if (!moreCompleted.Wait(TimeSpan.FromSeconds(30)))
+                            throw new TimeoutException("加载更多搜索结果超时。");
+                        if (resultCount <= initialResultCount)
+                            throw new InvalidOperationException("加载更多未返回新结果。");
+                    }
                     bridge.CancelAsync(requestId).GetAwaiter().GetResult();
                     File.WriteAllText(reportPath,
-                        "LiveTest=OK\r\nEngine=" + engine.Name + "\r\nPageComplete=Yes\r\n",
+                        "LiveTest=OK\r\nEngine=" + engine.Name +
+                        "\r\nPageComplete=Yes\r\nResultCount=" + resultCount +
+                        "\r\nAiResultCount=" + aiResultCount +
+                        "\r\nLoadMore=" + (batchCount >= 2 ? "Yes" : "NotAvailable") + "\r\n",
                         new UTF8Encoding(false));
                 }
                 return 0;
@@ -245,20 +293,56 @@ namespace QuickSearchFloat
                 if (!bridge.IsConnected)
                     throw new InvalidOperationException("本机桥接连接测试失败。");
 
+                InlineSearchResult receivedResult = null;
+                int receivedBatches = 0;
+                bool lastHasMore = false;
+                bridge.ResultReceived += delegate(string eventRequestId, InlineSearchResult result)
+                {
+                    receivedResult = result;
+                };
+                bridge.BatchCompleted += delegate(string eventRequestId, bool hasMore)
+                {
+                    receivedBatches++;
+                    lastHasMore = hasMore;
+                };
+
                 Task<string> readyTask = bridge.SearchAsync("https://example.test/search?q=test", 2);
                 string searchMessage = await ReceiveClientMessageAsync(client);
                 string[] searchParts = searchMessage.Split(new[] { '\t' }, 3);
                 if (searchParts.Length != 3 || searchParts[0] != "search")
                     throw new InvalidOperationException("搜索协议格式错误。");
 
+                await SendClientMessageAsync(client, "result\t" + searchParts[1] +
+                    "\tweb\t" + Uri.EscapeDataString("https://example.test/item") +
+                    "\t" + Uri.EscapeDataString("测试结果") +
+                    "\t" + Uri.EscapeDataString("包含空格与中文的摘要") +
+                    "\t" + Uri.EscapeDataString("example.test"));
+                await SendClientMessageAsync(client, "batch\t" + searchParts[1] + "\ttrue");
                 await SendClientMessageAsync(client, "ready\t" + searchParts[1]);
                 string requestId = await readyTask;
                 if (requestId != searchParts[1])
                     throw new InvalidOperationException("搜索协议请求编号不一致。");
+                if (receivedResult == null || receivedResult.Title != "测试结果" ||
+                    receivedResult.Snippet != "包含空格与中文的摘要" ||
+                    receivedBatches != 1 || !lastHasMore)
+                    throw new InvalidOperationException("内嵌搜索结果协议解析失败。");
 
-                Task showTask = bridge.ShowAsync(requestId, 2);
+                await bridge.LoadMoreAsync(requestId);
+                string moreMessage = await ReceiveClientMessageAsync(client);
+                if (moreMessage != "more\t" + requestId)
+                    throw new InvalidOperationException("加载更多协议格式错误。");
+                await SendClientMessageAsync(client, "batch\t" + requestId + "\tfalse");
+                DateTime batchDeadline = DateTime.UtcNow.AddSeconds(2);
+                while (receivedBatches < 2 && DateTime.UtcNow < batchDeadline)
+                    await Task.Delay(20);
+                if (receivedBatches != 2 || lastHasMore)
+                    throw new InvalidOperationException("加载更多完成状态解析失败。");
+
+                string targetUrl = "https://example.test/item";
+                Task showTask = bridge.ShowAsync(requestId, targetUrl, 2);
                 string showMessage = await ReceiveClientMessageAsync(client);
-                if (showMessage != "show\t" + requestId)
+                if (showMessage != "show\t" + requestId + "\t" +
+                    Uri.EscapeDataString(targetUrl))
                     throw new InvalidOperationException("跳转协议格式错误。");
                 await SendClientMessageAsync(client, "shown\t" + requestId);
                 await showTask;
@@ -681,9 +765,30 @@ namespace QuickSearchFloat
         }
     }
 
+    internal sealed class InlineSearchResult
+    {
+        public string Kind { get; private set; }
+        public string Url { get; private set; }
+        public string Title { get; private set; }
+        public string Snippet { get; private set; }
+        public string Source { get; private set; }
+
+        public InlineSearchResult(string kind, string url, string title, string snippet, string source)
+        {
+            Kind = kind;
+            Url = url;
+            Title = title;
+            Snippet = snippet;
+            Source = source;
+        }
+    }
+
     internal sealed class MainWindow : Window
     {
         private const int HotkeyId = 0x5153;
+        private const double SearchBarHeight = 80;
+        private const double ResultPanelGap = 12;
+        private const double ResultPanelHeight = 520;
 
         private SearchSettings _settings;
         private readonly TextBox _queryBox;
@@ -696,6 +801,23 @@ namespace QuickSearchFloat
         private readonly Border _glassBaseLayer;
         private readonly Border _glassAmbientLayer;
         private readonly Border _glassRimLayer;
+        private readonly Border _resultsShell;
+        private readonly Image _resultsBackdropImage;
+        private readonly BlurEffect _resultsBackdropBlur;
+        private readonly Border _resultsBaseLayer;
+        private readonly Border _resultsAmbientLayer;
+        private readonly Border _resultsRimLayer;
+        private readonly Grid _resultsMaterial;
+        private readonly Grid _resultsBackdropClip;
+        private readonly ScrollViewer _resultsScroll;
+        private readonly StackPanel _aiResultsPanel;
+        private readonly Button _resultsToggleButton;
+        private readonly TextBlock _resultsToggleLabel;
+        private readonly TextBlock _resultsToggleGlyph;
+        private readonly Grid _webResultsGrid;
+        private readonly StackPanel _leftResultsColumn;
+        private readonly StackPanel _rightResultsColumn;
+        private readonly TextBlock _resultsLoadingIndicator;
         private readonly System.Windows.Shapes.Path _searchGlyph;
         private readonly Forms.NotifyIcon _trayIcon;
         private readonly EdgeExtensionBridge _bridge;
@@ -703,6 +825,7 @@ namespace QuickSearchFloat
         private readonly Drawing.Icon _appIcon;
         private readonly bool _preview;
         private readonly bool _appearancePreview;
+        private readonly bool _resultsPreview;
         private HwndSource _source;
         private SearchEngine _selectedEngine;
         private string _bridgeStartError;
@@ -719,15 +842,29 @@ namespace QuickSearchFloat
         private bool _hotkeyRegistered;
         private bool _dynamicCaptureSupported = true;
         private bool _captureAffinityApplied;
+        private bool _inlineResultsVisible;
+        private bool _webResultsExpanded;
+        private bool _loadingMore;
+        private bool _hasMoreResults;
+        private int _searchGeneration;
+        private double _leftResultHeight;
+        private double _rightResultHeight;
+        private string _searchPageUrl;
+        private readonly List<InlineSearchResult> _inlineResults =
+            new List<InlineSearchResult>();
+        private readonly HashSet<string> _resultUrls =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        public MainWindow(SearchSettings settings, bool preview, bool appearancePreview)
+        public MainWindow(SearchSettings settings, bool preview, bool appearancePreview,
+            bool resultsPreview)
         {
             _settings = settings;
             _preview = preview;
             _appearancePreview = appearancePreview;
+            _resultsPreview = resultsPreview;
             Title = "快捷搜索";
             Width = 760;
-            Height = 80;
+            Height = SearchBarHeight;
             WindowStyle = WindowStyle.None;
             AllowsTransparency = true;
             Background = Brushes.Transparent;
@@ -753,6 +890,9 @@ namespace QuickSearchFloat
 
             _bridge = new EdgeExtensionBridge(EdgeExtensionBridge.DefaultPort);
             _bridge.ConnectionChanged += BridgeOnConnectionChanged;
+            _bridge.ResultReceived += BridgeOnResultReceived;
+            _bridge.BatchCompleted += BridgeOnBatchCompleted;
+            _bridge.SearchFailed += BridgeOnSearchFailed;
             try { _bridge.Start(); }
             catch (Exception ex) { _bridgeStartError = ex.Message; }
 
@@ -892,7 +1032,149 @@ namespace QuickSearchFloat
             Grid.SetColumn(_statusButton, 2);
             layout.Children.Add(_statusButton);
 
-            Content = _shell;
+            _resultsShell = new Border
+            {
+                CornerRadius = new CornerRadius(28),
+                Background = Brushes.Transparent,
+                Margin = new Thickness(0, ResultPanelGap, 0, 0),
+                Visibility = Visibility.Collapsed
+            };
+            _resultsMaterial = new Grid();
+            _resultsMaterial.Clip = new RectangleGeometry(
+                new Rect(0, 0, Width, ResultPanelHeight), 28, 28);
+            _resultsBackdropImage = new Image
+            {
+                Stretch = Stretch.Fill,
+                IsHitTestVisible = false
+            };
+            _resultsBackdropBlur = new BlurEffect
+            {
+                Radius = _settings.BlurRadius,
+                KernelType = KernelType.Gaussian,
+                RenderingBias = RenderingBias.Quality
+            };
+            _resultsBackdropImage.Effect = _resultsBackdropBlur;
+            _resultsBackdropClip = new Grid
+            {
+                Clip = new RectangleGeometry(
+                    new Rect(0, 0, Width, ResultPanelHeight), 28, 28),
+                IsHitTestVisible = false
+            };
+            _resultsBackdropClip.Children.Add(_resultsBackdropImage);
+            _resultsBaseLayer = new Border
+            {
+                CornerRadius = new CornerRadius(28),
+                IsHitTestVisible = false
+            };
+            _resultsAmbientLayer = new Border
+            {
+                CornerRadius = new CornerRadius(28),
+                IsHitTestVisible = false
+            };
+            _resultsRimLayer = new Border
+            {
+                CornerRadius = new CornerRadius(27),
+                Margin = new Thickness(1),
+                BorderThickness = new Thickness(1),
+                IsHitTestVisible = false
+            };
+            Panel.SetZIndex(_resultsRimLayer, 2);
+            _resultsMaterial.Children.Add(_resultsBackdropClip);
+            _resultsMaterial.Children.Add(_resultsBaseLayer);
+            _resultsMaterial.Children.Add(_resultsAmbientLayer);
+            _resultsMaterial.Children.Add(_resultsRimLayer);
+
+            StackPanel resultFlow = new StackPanel { Margin = new Thickness(14, 12, 14, 12) };
+            _aiResultsPanel = new StackPanel();
+            resultFlow.Children.Add(_aiResultsPanel);
+
+            Grid toggleContent = new Grid();
+            toggleContent.ColumnDefinitions.Add(new ColumnDefinition());
+            toggleContent.ColumnDefinitions.Add(
+                new ColumnDefinition { Width = GridLength.Auto });
+            _resultsToggleLabel = new TextBlock
+            {
+                Text = "网页结果",
+                FontSize = 13.5,
+                FontWeight = FontWeights.SemiBold,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(16, 0, 10, 0)
+            };
+            _resultsToggleGlyph = new TextBlock
+            {
+                Text = "\uE70D",
+                FontFamily = new FontFamily("Segoe Fluent Icons"),
+                FontSize = 13,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(8, 0, 16, 0)
+            };
+            Grid.SetColumn(_resultsToggleGlyph, 1);
+            toggleContent.Children.Add(_resultsToggleLabel);
+            toggleContent.Children.Add(_resultsToggleGlyph);
+            _resultsToggleButton = GlassButton("", 13, true);
+            _resultsToggleButton.Height = 46;
+            _resultsToggleButton.Margin = new Thickness(0);
+            _resultsToggleButton.BorderThickness = new Thickness(1);
+            _resultsToggleButton.Template = CreateGlassButtonTemplate(true, 16);
+            _resultsToggleButton.Content = toggleContent;
+            _resultsToggleButton.Visibility = Visibility.Collapsed;
+            _resultsToggleButton.Click += ResultsToggleOnClick;
+            System.Windows.Automation.AutomationProperties.SetName(
+                _resultsToggleButton, "展开网页结果");
+            resultFlow.Children.Add(_resultsToggleButton);
+
+            _webResultsGrid = new Grid
+            {
+                Visibility = Visibility.Collapsed,
+                Margin = new Thickness(0, 12, 0, 0)
+            };
+            _webResultsGrid.ColumnDefinitions.Add(new ColumnDefinition());
+            _webResultsGrid.ColumnDefinitions.Add(
+                new ColumnDefinition { Width = new GridLength(10) });
+            _webResultsGrid.ColumnDefinitions.Add(new ColumnDefinition());
+            _leftResultsColumn = new StackPanel();
+            _rightResultsColumn = new StackPanel();
+            Grid.SetColumn(_rightResultsColumn, 2);
+            _webResultsGrid.Children.Add(_leftResultsColumn);
+            _webResultsGrid.Children.Add(_rightResultsColumn);
+            resultFlow.Children.Add(_webResultsGrid);
+            _resultsLoadingIndicator = new TextBlock
+            {
+                Text = "•••",
+                FontSize = 15,
+                FontWeight = FontWeights.SemiBold,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(0, 3, 0, 2),
+                Visibility = Visibility.Collapsed
+            };
+            System.Windows.Automation.AutomationProperties.SetName(
+                _resultsLoadingIndicator, "正在加载更多搜索结果");
+            resultFlow.Children.Add(_resultsLoadingIndicator);
+            _resultsScroll = new ScrollViewer
+            {
+                Content = resultFlow,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Hidden,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                CanContentScroll = false,
+                Clip = new RectangleGeometry(
+                    new Rect(2, 2, Width - 4, ResultPanelHeight - 4), 26, 26)
+            };
+            _resultsScroll.ScrollChanged += ResultsScrollOnScrollChanged;
+            System.Windows.Automation.AutomationProperties.SetName(
+                _resultsScroll, "搜索结果瀑布流");
+            _resultsMaterial.Children.Add(_resultsScroll);
+            _resultsShell.Child = _resultsMaterial;
+
+            Grid windowRoot = new Grid();
+            windowRoot.RowDefinitions.Add(
+                new RowDefinition { Height = new GridLength(SearchBarHeight) });
+            windowRoot.RowDefinitions.Add(
+                new RowDefinition { Height = GridLength.Auto });
+            windowRoot.Children.Add(_shell);
+            Grid.SetRow(_resultsShell, 1);
+            windowRoot.Children.Add(_resultsShell);
+            Content = windowRoot;
+            SizeToContent = SizeToContent.Height;
             ApplyTheme();
             LoadEngines();
 
@@ -924,13 +1206,15 @@ namespace QuickSearchFloat
                     SetStatus("正在等待 Edge 扩展连接…", "#FFB54708", false);
                 if (_appearancePreview)
                     Dispatcher.BeginInvoke(new Action(EditGeneralSettings));
+                if (_resultsPreview)
+                    Dispatcher.BeginInvoke(new Action(ShowResultsPreview));
             };
             Closing += delegate(object sender, System.ComponentModel.CancelEventArgs e)
             {
                 if (!_exiting)
                 {
                     e.Cancel = true;
-                    Hide();
+                    HideSearch();
                 }
             };
             Closed += delegate { Cleanup(); };
@@ -938,7 +1222,7 @@ namespace QuickSearchFloat
             KeyDown += delegate(object sender, KeyEventArgs e)
             {
                 if (e.Key == Key.Escape)
-                    Hide();
+                    HideSearch();
             };
         }
 
@@ -1030,14 +1314,17 @@ namespace QuickSearchFloat
                 : _settings.LightBackgroundColor);
             glassTop.A = (byte)Math.Round(255 * _settings.BackgroundOpacity / 100.0);
             _glassBaseLayer.Background = new SolidColorBrush(glassTop);
+            _resultsBaseLayer.Background = new SolidColorBrush(glassTop);
 
-            _glassAmbientLayer.Background = new LinearGradientBrush(
+            LinearGradientBrush ambient = new LinearGradientBrush(
                 ColorFrom(_isDark ? "#147DD3FC" : "#207DD3FC"),
                 ColorFrom(_isDark ? "#10F3A4FF" : "#18FFB6E6"),
                 new Point(0, 0), new Point(1, 1))
             {
                 ColorInterpolationMode = ColorInterpolationMode.ScRgbLinearInterpolation
             };
+            _glassAmbientLayer.Background = ambient;
+            _resultsAmbientLayer.Background = ambient.Clone();
             _idleRimBrush = new LinearGradientBrush(
                 new GradientStopCollection
                 {
@@ -1048,6 +1335,7 @@ namespace QuickSearchFloat
                 }, new Point(0, 0), new Point(1, 1));
             if (!_busy && !_readyToOpen)
                 _glassRimLayer.BorderBrush = _idleRimBrush;
+            _resultsRimLayer.BorderBrush = _idleRimBrush;
 
             Brush foreground = Brush(_isDark ? "#FFF5F7FA" : "#F20B1220");
             Brush secondary = Brush(_isDark ? "#D1C9CFD8" : "#C2485565");
@@ -1061,8 +1349,18 @@ namespace QuickSearchFloat
             _statusButton.Background = Brush(_isDark ? "#26FFFFFF" : "#78FFFFFF");
             _statusButton.Foreground = Brush(DarkStatusColor(_statusColor));
             _backdropBlur.Radius = _settings.BlurRadius;
+            _resultsBackdropBlur.Radius = _settings.BlurRadius;
             _backdropImage.Visibility = _settings.BlurRadius > 0
                 ? Visibility.Visible : Visibility.Collapsed;
+            _resultsBackdropImage.Visibility = _settings.BlurRadius > 0 &&
+                _inlineResultsVisible ? Visibility.Visible : Visibility.Collapsed;
+            _resultsToggleButton.Foreground = foreground;
+            _resultsToggleButton.Background = Brush(
+                _isDark ? "#20FFFFFF" : "#52FFFFFF");
+            _resultsToggleButton.BorderBrush = Brush(
+                _isDark ? "#2EFFFFFF" : "#66FFFFFF");
+            _resultsLoadingIndicator.Foreground = secondary;
+            RebuildResultCards();
             ConfigureDynamicBlurTimer();
         }
 
@@ -1070,7 +1368,8 @@ namespace QuickSearchFloat
         {
             _dynamicBlurTimer.Interval = TimeSpan.FromSeconds(
                 1.0 / SearchSettings.NormalizeDynamicBlurFps(_settings.DynamicBlurFps));
-            bool shouldRun = _settings.DynamicBlur && _settings.BlurRadius > 0 &&
+            bool shouldRun = !_resultsPreview && _settings.DynamicBlur &&
+                _settings.BlurRadius > 0 &&
                 IsVisible && _source != null && _dynamicCaptureSupported;
             if (shouldRun)
             {
@@ -1140,6 +1439,19 @@ namespace QuickSearchFloat
 
         private void SelectEngine(SearchEngine engine)
         {
+            if (_selectedEngine != null && engine != _selectedEngine &&
+                !string.IsNullOrWhiteSpace(_lastRequestId))
+            {
+                string requestId = _lastRequestId;
+                _lastRequestId = null;
+                _searchPageUrl = null;
+                ClearInlineResults();
+                ShowIdleControls();
+                Task ignored = _bridge.CancelAsync(requestId).ContinueWith(delegate(Task task)
+                {
+                    if (task.IsFaulted) { Exception observed = task.Exception; }
+                });
+            }
             _selectedEngine = engine;
             _placeholder.Text = engine.Name;
             System.Windows.Automation.AutomationProperties.SetName(
@@ -1271,7 +1583,12 @@ namespace QuickSearchFloat
         private void HideIfInactive()
         {
             if (!_preview && _focusGuardCount == 0 && !IsActive)
-                Hide();
+            {
+                if (_busy)
+                    Hide();
+                else
+                    HideSearch();
+            }
         }
 
         private void ShowIdleControls()
@@ -1403,7 +1720,7 @@ namespace QuickSearchFloat
             if (message == NativeMethods.WmHotkey && wParam.ToInt32() == HotkeyId)
             {
                 if (IsVisible)
-                    Hide();
+                    HideSearch();
                 else
                     ShowSearch();
                 handled = true;
@@ -1418,15 +1735,65 @@ namespace QuickSearchFloat
             Top = area.Top + Math.Max(42, area.Height * 0.14);
         }
 
-        private void RefreshBackdrop()
+        private void RefreshBackdrop(double? resultHeightOverride = null)
         {
             if (_settings.BlurRadius <= 0)
             {
                 _backdropImage.Source = null;
                 _backdropImage.Visibility = Visibility.Collapsed;
+                _resultsBackdropImage.Source = null;
+                _resultsBackdropImage.Visibility = Visibility.Collapsed;
                 return;
             }
 
+            bool temporaryCaptureExclusion = false;
+            if (IsVisible && !_captureAffinityApplied && _source != null)
+            {
+                temporaryCaptureExclusion = NativeMethods.SetWindowDisplayAffinity(
+                    new WindowInteropHelper(this).Handle,
+                    NativeMethods.WdaExcludeFromCapture);
+                if (temporaryCaptureExclusion)
+                    NativeMethods.DwmFlush();
+            }
+            try
+            {
+                CaptureBackdropSurface(_backdropImage, Left, Top, Width, SearchBarHeight);
+                double resultHeight = resultHeightOverride ?? _resultsShell.ActualHeight;
+                if (_inlineResultsVisible && resultHeight > 0)
+                {
+                    UpdateResultsGeometry(resultHeight);
+                    CaptureBackdropSurface(_resultsBackdropImage, Left,
+                        Top + SearchBarHeight + ResultPanelGap,
+                        Width, resultHeight);
+                }
+                else
+                {
+                    _resultsBackdropImage.Source = null;
+                    _resultsBackdropImage.Visibility = Visibility.Collapsed;
+                }
+            }
+            finally
+            {
+                if (temporaryCaptureExclusion)
+                    NativeMethods.SetWindowDisplayAffinity(
+                        new WindowInteropHelper(this).Handle, NativeMethods.WdaNone);
+            }
+        }
+
+        private void UpdateResultsGeometry(double height)
+        {
+            height = Math.Max(1, height);
+            _resultsMaterial.Clip = new RectangleGeometry(
+                new Rect(0, 0, Width, height), 28, 28);
+            _resultsBackdropClip.Clip = new RectangleGeometry(
+                new Rect(0, 0, Width, height), 28, 28);
+            _resultsScroll.Clip = new RectangleGeometry(
+                new Rect(2, 2, Width - 4, Math.Max(1, height - 4)), 26, 26);
+        }
+
+        private void CaptureBackdropSurface(Image target, double surfaceLeft, double surfaceTop,
+            double surfaceWidth, double surfaceHeight)
+        {
             double scaleX = 1;
             double scaleY = 1;
             if (_source != null && _source.CompositionTarget != null)
@@ -1437,10 +1804,12 @@ namespace QuickSearchFloat
             }
 
             double padding = Math.Max(8, _settings.BlurRadius * 2);
-            int pixelLeft = (int)Math.Round((Left - padding) * scaleX);
-            int pixelTop = (int)Math.Round((Top - padding) * scaleY);
-            int pixelWidth = Math.Max(1, (int)Math.Ceiling((Width + padding * 2) * scaleX));
-            int pixelHeight = Math.Max(1, (int)Math.Ceiling((Height + padding * 2) * scaleY));
+            int pixelLeft = (int)Math.Round((surfaceLeft - padding) * scaleX);
+            int pixelTop = (int)Math.Round((surfaceTop - padding) * scaleY);
+            int pixelWidth = Math.Max(1,
+                (int)Math.Ceiling((surfaceWidth + padding * 2) * scaleX));
+            int pixelHeight = Math.Max(1,
+                (int)Math.Ceiling((surfaceHeight + padding * 2) * scaleY));
 
             try
             {
@@ -1456,11 +1825,11 @@ namespace QuickSearchFloat
                         BitmapSource source = Imaging.CreateBitmapSourceFromHBitmap(bitmapHandle,
                             IntPtr.Zero, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
                         source.Freeze();
-                        _backdropImage.Source = source;
-                        _backdropImage.Width = Width + padding * 2;
-                        _backdropImage.Height = Height + padding * 2;
-                        _backdropImage.Margin = new Thickness(-padding);
-                        _backdropImage.Visibility = Visibility.Visible;
+                        target.Source = source;
+                        target.Width = surfaceWidth + padding * 2;
+                        target.Height = surfaceHeight + padding * 2;
+                        target.Margin = new Thickness(-padding);
+                        target.Visibility = Visibility.Visible;
                     }
                     finally
                     {
@@ -1470,13 +1839,15 @@ namespace QuickSearchFloat
             }
             catch (Exception)
             {
-                _backdropImage.Source = null;
-                _backdropImage.Visibility = Visibility.Collapsed;
+                if (target.Source == null)
+                    target.Visibility = Visibility.Collapsed;
             }
         }
 
         private void ShowSearch()
         {
+            ResetSearchSession();
+            UpdateLayout();
             PositionWindow();
             RefreshBackdrop();
             Show();
@@ -1491,6 +1862,36 @@ namespace QuickSearchFloat
             }
             _queryBox.Focus();
             _queryBox.SelectAll();
+        }
+
+        private void HideSearch()
+        {
+            ResetSearchSession();
+            UpdateLayout();
+            Hide();
+        }
+
+        private void ResetSearchSession()
+        {
+            _searchGeneration++;
+            string requestId = _lastRequestId;
+            _lastRequestId = null;
+            _searchPageUrl = null;
+            _busy = false;
+            ClearInlineResults();
+            _queryBox.Clear();
+            if (_bridge.IsConnected)
+                ShowIdleControls();
+            else
+                SetStatus("Edge 扩展未连接", "#FFB54708", false);
+
+            if (string.IsNullOrWhiteSpace(requestId))
+                return;
+            // ponytail: 唤醒先清空界面，后台取消只做收尾；会话编号负责丢弃迟到回调。
+            Task ignored = _bridge.CancelAsync(requestId).ContinueWith(delegate(Task task)
+            {
+                if (task.IsFaulted) { Exception observed = task.Exception; }
+            });
         }
 
         private void QueryBoxOnKeyDown(object sender, KeyEventArgs e)
@@ -1524,6 +1925,7 @@ namespace QuickSearchFloat
                 return;
             }
 
+            int generation = ++_searchGeneration;
             _busy = true;
             ShowLoadingState();
             Task minimumPulse = Task.Delay(900);
@@ -1531,26 +1933,55 @@ namespace QuickSearchFloat
             {
                 if (!string.IsNullOrWhiteSpace(_lastRequestId))
                     await _bridge.CancelAsync(_lastRequestId);
+                if (generation != _searchGeneration)
+                    return;
                 _lastRequestId = null;
+                ClearInlineResults();
 
                 string url = SearchHelper.BuildSearchUrl(query, engine.Template);
-                _lastRequestId = await _bridge.SearchAsync(url, 30);
+                _searchPageUrl = url;
+                string requestId = await _bridge.SearchAsync(url, 30, delegate(string assignedId)
+                {
+                    if (generation == _searchGeneration)
+                        _lastRequestId = assignedId;
+                });
+                if (generation != _searchGeneration)
+                {
+                    await _bridge.CancelAsync(requestId);
+                    return;
+                }
+                _lastRequestId = requestId;
                 // 保证快速网页也能完整显示一次呼吸动画。
                 await minimumPulse;
-                ShowReadyToOpen();
+                if (generation != _searchGeneration)
+                    return;
+                if (SearchHelper.SupportsInlineResults(url) && _inlineResults.Count > 0)
+                    ShowInlineResultsReady();
+                else
+                    ShowReadyToOpen();
             }
             catch (Exception ex)
             {
+                if (generation != _searchGeneration)
+                    return;
                 _lastRequestId = null;
+                _searchPageUrl = null;
+                ClearInlineResults();
                 SetStatus("后台加载失败：" + ex.Message, "#FFD92D20", false);
             }
             finally
             {
-                _busy = false;
+                if (generation == _searchGeneration)
+                    _busy = false;
             }
         }
 
-        private async void StatusButtonOnClick(object sender, RoutedEventArgs e)
+        private void StatusButtonOnClick(object sender, RoutedEventArgs e)
+        {
+            OpenSearchTarget(null);
+        }
+
+        private async void OpenSearchTarget(string targetUrl)
         {
             if (string.IsNullOrWhiteSpace(_lastRequestId) || _busy)
                 return;
@@ -1562,16 +1993,17 @@ namespace QuickSearchFloat
             try
             {
                 NativeMethods.AllowAnyProcessToSetForegroundWindow();
-                await _bridge.ShowAsync(requestId, 5);
+                await _bridge.ShowAsync(requestId, targetUrl, 8);
                 _lastRequestId = null;
-                ShowIdleControls();
-                Hide();
+                _searchPageUrl = null;
+                HideSearch();
                 bool activated = NativeMethods.BringProcessWindowToFront("msedge");
                 if (_preview)
                 {
                     File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
                             "ui-handoff-test.txt"),
                         "BrowserActivated=" + (activated ? "Yes" : "No") +
+                        "\r\nTarget=" + (targetUrl ?? "SearchPage") +
                         "\r\nForegroundProcess=" + NativeMethods.GetForegroundProcessName() + "\r\n",
                         new UTF8Encoding(false));
                 }
@@ -1669,6 +2101,494 @@ namespace QuickSearchFloat
             if (color == "#FFD92D20") return "#FFFF453A";
             if (color == "#FFB54708") return "#FFFF9F0A";
             return "#FFD1D5DB";
+        }
+
+        private void BridgeOnResultReceived(string requestId, InlineSearchResult result)
+        {
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                if (requestId != _lastRequestId || !_resultUrls.Add(result.Url))
+                    return;
+                _inlineResults.Add(result);
+                AddResultCard(result);
+                UpdateResultsToggle();
+            }));
+        }
+
+        private void BridgeOnBatchCompleted(string requestId, bool hasMore)
+        {
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                if (requestId != _lastRequestId)
+                    return;
+                _hasMoreResults = hasMore;
+                _loadingMore = false;
+                _resultsLoadingIndicator.Visibility = Visibility.Collapsed;
+                UpdateResultsToggle();
+                if (_readyToOpen && _inlineResults.Count > 0)
+                    ShowResultsPanel();
+                if (_webResultsExpanded)
+                    Dispatcher.BeginInvoke(new Action(TryLoadMoreResults),
+                        DispatcherPriority.Background);
+            }));
+        }
+
+        private void BridgeOnSearchFailed(string requestId, string detail)
+        {
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                if (requestId != _lastRequestId || _busy)
+                    return;
+                _loadingMore = false;
+                _hasMoreResults = false;
+                _resultsLoadingIndicator.Visibility = Visibility.Collapsed;
+                if (_inlineResults.Count == 0)
+                    SetStatus("结果解析失败：" + detail, "#FFD92D20", false);
+            }));
+        }
+
+        private void ResultsScrollOnScrollChanged(object sender, ScrollChangedEventArgs e)
+        {
+            TryLoadMoreResults();
+        }
+
+        private void TryLoadMoreResults()
+        {
+            if (!_inlineResultsVisible || !_webResultsExpanded ||
+                !_hasMoreResults || _loadingMore ||
+                _busy || string.IsNullOrWhiteSpace(_lastRequestId))
+                return;
+            double remaining = _resultsScroll.ScrollableHeight - _resultsScroll.VerticalOffset;
+            if (_resultsScroll.ScrollableHeight > 0 && remaining > 180)
+                return;
+            LoadMoreResults();
+        }
+
+        private async void LoadMoreResults()
+        {
+            if (_loadingMore || !_hasMoreResults || string.IsNullOrWhiteSpace(_lastRequestId))
+                return;
+            _loadingMore = true;
+            _resultsLoadingIndicator.Visibility = Visibility.Visible;
+            try
+            {
+                await _bridge.LoadMoreAsync(_lastRequestId);
+            }
+            catch (Exception ex)
+            {
+                _loadingMore = false;
+                _hasMoreResults = false;
+                _resultsLoadingIndicator.Visibility = Visibility.Collapsed;
+                if (_inlineResults.Count == 0)
+                    SetStatus("无法加载搜索结果：" + ex.Message, "#FFD92D20", false);
+            }
+        }
+
+        private void ShowResultsPanel()
+        {
+            _inlineResultsVisible = true;
+            UpdateResultsToggle();
+            _resultsShell.Visibility = Visibility.Visible;
+            _resultsShell.Height = _webResultsExpanded ? ResultPanelHeight : double.NaN;
+            UpdateLayout();
+            UpdateResultsGeometry(_webResultsExpanded
+                ? ResultPanelHeight : _resultsShell.ActualHeight);
+            PositionWindow();
+            RefreshBackdrop();
+        }
+
+        private void ResultsToggleOnClick(object sender, RoutedEventArgs e)
+        {
+            SetWebResultsExpanded(!_webResultsExpanded);
+            e.Handled = true;
+        }
+
+        private void SetWebResultsExpanded(bool expanded)
+        {
+            int webCount = _inlineResults.Count(result => result.Kind != "ai");
+            bool nextExpanded = expanded && webCount > 0;
+            double targetHeight = nextExpanded
+                ? ResultPanelHeight
+                : 24 + _aiResultsPanel.ActualHeight +
+                    (_resultsToggleButton.Visibility == Visibility.Visible
+                        ? _resultsToggleButton.ActualHeight : 0);
+            // ponytail: 先准备目标高度的模糊背景，再提交布局，避免空白中间帧。
+            RefreshBackdrop(targetHeight);
+            _webResultsExpanded = nextExpanded;
+            _webResultsGrid.Visibility = _webResultsExpanded
+                ? Visibility.Visible : Visibility.Collapsed;
+            _resultsLoadingIndicator.Visibility = _webResultsExpanded && _loadingMore
+                ? Visibility.Visible : Visibility.Collapsed;
+            _resultsShell.Height = _webResultsExpanded ? ResultPanelHeight : double.NaN;
+            _resultsScroll.ScrollToTop();
+            UpdateResultsToggle();
+            UpdateLayout();
+            UpdateResultsGeometry(targetHeight);
+            PositionWindow();
+            if (_webResultsExpanded)
+                TryLoadMoreResults();
+        }
+
+        private void UpdateResultsToggle()
+        {
+            int webCount = _inlineResults.Count(result => result.Kind != "ai");
+            if (webCount == 0)
+                _webResultsExpanded = false;
+            _resultsToggleButton.Visibility = webCount > 0
+                ? Visibility.Visible : Visibility.Collapsed;
+            _resultsToggleLabel.Text = "网页结果  " + webCount;
+            _resultsToggleGlyph.Text = _webResultsExpanded ? "\uE70E" : "\uE70D";
+            System.Windows.Automation.AutomationProperties.SetName(
+                _resultsToggleButton,
+                (_webResultsExpanded ? "收起" : "展开") + webCount + "条网页结果");
+        }
+
+        private void ClearInlineResults()
+        {
+            _inlineResults.Clear();
+            _resultUrls.Clear();
+            _aiResultsPanel.Children.Clear();
+            _leftResultsColumn.Children.Clear();
+            _rightResultsColumn.Children.Clear();
+            _leftResultHeight = 0;
+            _rightResultHeight = 0;
+            _webResultsExpanded = false;
+            _hasMoreResults = false;
+            _loadingMore = false;
+            _webResultsGrid.Visibility = Visibility.Collapsed;
+            _resultsToggleButton.Visibility = Visibility.Collapsed;
+            _resultsLoadingIndicator.Visibility = Visibility.Collapsed;
+            _resultsScroll.ScrollToTop();
+            _inlineResultsVisible = false;
+            _resultsShell.Visibility = Visibility.Collapsed;
+            _resultsShell.Height = double.NaN;
+            _resultsBackdropImage.Source = null;
+            _resultsBackdropImage.Width = double.NaN;
+            _resultsBackdropImage.Height = double.NaN;
+            _resultsBackdropImage.Margin = new Thickness(0);
+            PositionWindow();
+        }
+
+        private void RebuildResultCards()
+        {
+            if (_aiResultsPanel == null)
+                return;
+            _aiResultsPanel.Children.Clear();
+            _leftResultsColumn.Children.Clear();
+            _rightResultsColumn.Children.Clear();
+            _leftResultHeight = 0;
+            _rightResultHeight = 0;
+            foreach (InlineSearchResult result in _inlineResults)
+                AddResultCard(result);
+            UpdateResultsToggle();
+        }
+
+        private void AddResultCard(InlineSearchResult result)
+        {
+            FrameworkElement card = CreateResultCard(result);
+            if (result.Kind == "ai")
+            {
+                _aiResultsPanel.Children.Add(card);
+                return;
+            }
+
+            double estimate = 92 + Math.Min(150,
+                Math.Ceiling(result.Snippet.Length / 34.0) * 18);
+            // ponytail: 以文本长度估算列高；只有肉眼失衡时才需要自定义测量面板。
+            if (_leftResultHeight <= _rightResultHeight)
+            {
+                _leftResultsColumn.Children.Add(card);
+                _leftResultHeight += estimate;
+            }
+            else
+            {
+                _rightResultsColumn.Children.Add(card);
+                _rightResultHeight += estimate;
+            }
+        }
+
+        private FrameworkElement CreateResultCard(InlineSearchResult result)
+        {
+            bool isAi = result.Kind == "ai";
+            StackPanel content = new StackPanel { Margin = new Thickness(15, 13, 15, 14) };
+            TextBlock source = new TextBlock
+            {
+                Text = isAi ? "AI 优先 · " + result.Source : result.Source,
+                FontSize = 11.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = Brush(isAi
+                    ? (_isDark ? "#FF64D2FF" : "#FF007AFF")
+                    : (_isDark ? "#BFC9CFD8" : "#A6485565")),
+                TextTrimming = TextTrimming.CharacterEllipsis
+            };
+            if (isAi)
+            {
+                content.Children.Add(source);
+            }
+            else
+            {
+                Grid sourceRow = new Grid();
+                sourceRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                sourceRow.ColumnDefinitions.Add(new ColumnDefinition
+                    { Width = new GridLength(1, GridUnitType.Star) });
+                FrameworkElement favicon = CreateFaviconBadge(result);
+                sourceRow.Children.Add(favicon);
+                Grid.SetColumn(source, 1);
+                source.VerticalAlignment = VerticalAlignment.Center;
+                sourceRow.Children.Add(source);
+                content.Children.Add(sourceRow);
+
+                TextBlock title = new TextBlock
+                {
+                    Text = result.Title,
+                    FontSize = 15.5,
+                    FontWeight = FontWeights.SemiBold,
+                    Foreground = Brush(_isDark ? "#FFF7F8FA" : "#FF101722"),
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 6, 0, result.Snippet.Length > 0 ? 7 : 0)
+                };
+                content.Children.Add(title);
+            }
+            if (result.Snippet.Length > 0)
+            {
+                TextBlock snippet = new TextBlock
+                {
+                    Text = result.Snippet,
+                    FontSize = 13,
+                    LineHeight = 19,
+                    Foreground = Brush(_isDark ? "#D9D5DAE2" : "#C43A4656"),
+                    TextWrapping = TextWrapping.Wrap,
+                    MaxHeight = isAi ? 190 : 133,
+                    Margin = isAi ? new Thickness(0, 7, 0, 0) : new Thickness(0)
+                };
+                content.Children.Add(snippet);
+            }
+
+            if (isAi)
+            {
+                Border aiCard = new Border
+                {
+                    Child = content,
+                    Background = Brush(_isDark ? "#287DD3FC" : "#327DD3FC"),
+                    BorderBrush = Brush(_isDark ? "#2EFFFFFF" : "#66FFFFFF"),
+                    BorderThickness = new Thickness(1),
+                    CornerRadius = new CornerRadius(18),
+                    Margin = new Thickness(0, 0, 0, 12)
+                };
+                System.Windows.Automation.AutomationProperties.SetName(
+                    aiCard, "AI 搜索结果：" + result.Snippet);
+                System.Windows.Automation.AutomationProperties.SetHelpText(
+                    aiCard, "AI 生成的纯文字摘要");
+                return aiCard;
+            }
+
+            Button card = new Button
+            {
+                Content = content,
+                Tag = result,
+                HorizontalContentAlignment = HorizontalAlignment.Stretch,
+                VerticalContentAlignment = VerticalAlignment.Top,
+                Background = Brush(_isDark ? "#20FFFFFF" : "#9EFFFFFF"),
+                BorderBrush = Brush(_isDark ? "#2EFFFFFF" : "#66FFFFFF"),
+                BorderThickness = new Thickness(1),
+                Margin = new Thickness(0, 0, 0, 10),
+                Cursor = Cursors.Hand,
+                Template = CreateResultCardTemplate()
+            };
+            card.Click += ResultCardOnClick;
+            System.Windows.Automation.AutomationProperties.SetName(
+                card, "搜索结果：" + result.Title);
+            System.Windows.Automation.AutomationProperties.SetHelpText(
+                card, "点击后在 Edge 中打开");
+            return card;
+        }
+
+        private FrameworkElement CreateFaviconBadge(InlineSearchResult result)
+        {
+            string initial = string.IsNullOrWhiteSpace(result.Source)
+                ? "•"
+                : result.Source.Trim().Substring(0, 1).ToUpperInvariant();
+            Grid badge = new Grid();
+            badge.Children.Add(new TextBlock
+            {
+                Text = initial,
+                FontSize = 10,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = Brush(_isDark ? "#FFD8DEE8" : "#FF344054"),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            });
+
+            string faviconUrl = SearchHelper.BuildFaviconUrl(result.Url);
+            if (faviconUrl != null)
+            {
+                Image image = new Image
+                {
+                    Width = 14,
+                    Height = 14,
+                    Stretch = Stretch.Uniform
+                };
+                badge.Children.Add(image);
+                LoadFavicon(image, faviconUrl);
+            }
+
+            Border surface = new Border
+            {
+                Width = 18,
+                Height = 18,
+                Margin = new Thickness(0, 0, 7, 0),
+                CornerRadius = new CornerRadius(5),
+                Background = Brush(_isDark ? "#28FFFFFF" : "#B8FFFFFF"),
+                Child = badge
+            };
+            System.Windows.Automation.AutomationProperties.SetName(
+                surface, result.Source + " 网站图标");
+            return surface;
+        }
+
+        private async void LoadFavicon(Image image, string faviconUrl)
+        {
+            try
+            {
+                byte[] data;
+                using (WebClient client = new WebClient())
+                {
+                    client.Headers[HttpRequestHeader.UserAgent] = "Mozilla/5.0";
+                    data = await client.DownloadDataTaskAsync(new Uri(faviconUrl));
+                }
+                using (MemoryStream stream = new MemoryStream(data))
+                {
+                    BitmapImage bitmap = new BitmapImage();
+                    bitmap.BeginInit();
+                    bitmap.CacheOption = BitmapCacheOption.OnLoad;
+                    bitmap.DecodePixelWidth = 32;
+                    bitmap.StreamSource = stream;
+                    bitmap.EndInit();
+                    bitmap.Freeze();
+                    image.Source = bitmap;
+                    Panel parent = image.Parent as Panel;
+                    if (parent != null && parent.Children.Count > 0)
+                        parent.Children[0].Visibility = Visibility.Collapsed;
+                }
+            }
+            catch (Exception)
+            {
+                image.Visibility = Visibility.Collapsed;
+            }
+        }
+
+        private static ControlTemplate CreateResultCardTemplate()
+        {
+            ControlTemplate template = new ControlTemplate(typeof(Button));
+            FrameworkElementFactory surface = new FrameworkElementFactory(typeof(Border));
+            surface.Name = "Surface";
+            surface.SetValue(Border.CornerRadiusProperty, new CornerRadius(18));
+            surface.SetBinding(Border.BackgroundProperty, new Binding("Background")
+            {
+                RelativeSource = RelativeSource.TemplatedParent
+            });
+            surface.SetBinding(Border.BorderBrushProperty, new Binding("BorderBrush")
+            {
+                RelativeSource = RelativeSource.TemplatedParent
+            });
+            surface.SetBinding(Border.BorderThicknessProperty, new Binding("BorderThickness")
+            {
+                RelativeSource = RelativeSource.TemplatedParent
+            });
+            FrameworkElementFactory presenter = new FrameworkElementFactory(typeof(ContentPresenter));
+            presenter.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Stretch);
+            presenter.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Top);
+            presenter.SetBinding(ContentPresenter.ContentProperty, new Binding("Content")
+            {
+                RelativeSource = RelativeSource.TemplatedParent
+            });
+            surface.AppendChild(presenter);
+            template.VisualTree = surface;
+
+            Trigger hover = new Trigger { Property = Button.IsMouseOverProperty, Value = true };
+            hover.Setters.Add(new Setter(Border.BackgroundProperty, Brush("#3A7DD3FC"), "Surface"));
+            template.Triggers.Add(hover);
+            Trigger pressed = new Trigger { Property = Button.IsPressedProperty, Value = true };
+            pressed.Setters.Add(new Setter(Button.OpacityProperty, 0.82));
+            template.Triggers.Add(pressed);
+            Trigger focus = new Trigger { Property = Button.IsKeyboardFocusedProperty, Value = true };
+            focus.Setters.Add(new Setter(Border.BorderBrushProperty, Brush("#FF0A84FF"), "Surface"));
+            focus.Setters.Add(new Setter(Border.BorderThicknessProperty, new Thickness(1.5), "Surface"));
+            template.Triggers.Add(focus);
+            return template;
+        }
+
+        private void ResultCardOnClick(object sender, RoutedEventArgs e)
+        {
+            InlineSearchResult result = ((Button)sender).Tag as InlineSearchResult;
+            if (result != null)
+                OpenSearchTarget(result.Url);
+        }
+
+        private void ShowInlineResultsReady()
+        {
+            _readyToOpen = true;
+            SetShellLight(DarkStatusColor("#FF067647"), false);
+            _statusButton.Visibility = Visibility.Collapsed;
+            _statusButton.IsHitTestVisible = false;
+            _settingsButton.Visibility = Visibility.Collapsed;
+            _queryBox.IsReadOnly = true;
+            _shell.Cursor = Cursors.Hand;
+            ShowResultsPanel();
+            System.Windows.Automation.AutomationProperties.SetHelpText(
+                _queryBox, "点击搜索框或按 Enter 打开搜索页；下方可展开网页结果");
+        }
+
+        private void ShowResultsPreview()
+        {
+            ClearInlineResults();
+            _queryBox.Text = "Liquid Glass 设计";
+            _lastRequestId = "results-preview";
+            InlineSearchResult[] previewResults =
+            {
+                new InlineSearchResult("ai", "https://www.google.com/search?q=Liquid+Glass",
+                    "AI 概览",
+                    "Liquid Glass 是一种强调真实背景折射、连续透明层次与柔和边缘响应的界面语言。设计时应优先保证文字对比度、点击区域和滚动内容的可读性。",
+                    "Google"),
+                new InlineSearchResult("web", "https://developer.apple.com/design/",
+                    "Apple Design Resources",
+                    "查看界面材质、排版、颜色和交互组件的官方设计资源。",
+                    "developer.apple.com"),
+                new InlineSearchResult("web", "https://learn.microsoft.com/windows/apps/design/",
+                    "Windows 应用设计指南",
+                    "介绍 Windows 桌面应用中的布局、材质、无障碍和输入交互。",
+                    "learn.microsoft.com"),
+                new InlineSearchResult("web", "https://example.com/material",
+                    "透明材质如何保持内容可读",
+                    "在复杂桌面背景上，玻璃面板需要稳定的染色层、清晰描边和足够的文字对比度。较长摘要会自然形成不等高卡片。",
+                    "example.com"),
+                new InlineSearchResult("web", "https://example.com/blur",
+                    "Gaussian Blur 实时渲染",
+                    "动态取样时应避免窗口递归捕获，并根据设备性能选择合理刷新率。",
+                    "example.com"),
+                new InlineSearchResult("web", "https://example.com/masonry",
+                    "双列瀑布流布局实践",
+                    "卡片按当前两列估算高度分配，能够在不引入额外布局库的情况下保持紧凑阅读节奏。",
+                    "example.com"),
+                new InlineSearchResult("web", "https://example.com/accessibility",
+                    "玻璃界面的无障碍检查",
+                    "透明并不意味着低对比。焦点态、键盘操作和明确的可点击反馈仍然不可缺少。",
+                    "example.com")
+            };
+            // ponytail: 预览需要实际溢出，才能捕获结果面板的圆角裁切回归。
+            previewResults = previewResults.Concat(Enumerable.Range(1, 6).Select(index =>
+                new InlineSearchResult("web", "https://example.com/overflow/" + index,
+                    "滚动边界测试 " + index, "用于验证卡片滚动时始终裁切在玻璃面板圆角内。",
+                    "example.com"))).ToArray();
+            foreach (InlineSearchResult result in previewResults)
+            {
+                _resultUrls.Add(result.Url);
+                _inlineResults.Add(result);
+                AddResultCard(result);
+            }
+            _hasMoreResults = false;
+            ShowResultsPanel();
+            ShowInlineResultsReady();
         }
 
         private void LoadEngines()
@@ -2614,6 +3534,29 @@ namespace QuickSearchFloat
             return template.Replace("{query}", Uri.EscapeDataString(query));
         }
 
+        public static bool SupportsInlineResults(string url)
+        {
+            Uri uri;
+            if (!Uri.TryCreate(url, UriKind.Absolute, out uri))
+                return false;
+            string host = uri.Host.ToLowerInvariant();
+            return host == "google.com" || host == "www.google.com" ||
+                host.EndsWith(".google.com", StringComparison.Ordinal) ||
+                host == "bing.com" || host == "www.bing.com" ||
+                host.EndsWith(".bing.com", StringComparison.Ordinal) ||
+                host == "baidu.com" || host == "www.baidu.com" ||
+                host.EndsWith(".baidu.com", StringComparison.Ordinal);
+        }
+
+        public static string BuildFaviconUrl(string resultUrl)
+        {
+            Uri uri;
+            if (!Uri.TryCreate(resultUrl, UriKind.Absolute, out uri) ||
+                (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+                return null;
+            return uri.GetLeftPart(UriPartial.Authority).TrimEnd('/') + "/favicon.ico";
+        }
+
         public static string GetDefaultBrowserExecutable()
         {
             uint length = 0;
@@ -2630,7 +3573,7 @@ namespace QuickSearchFloat
     internal sealed class EdgeExtensionBridge : IDisposable
     {
         public const int DefaultPort = 17891;
-        private const int MaximumMessageBytes = 16384;
+        private const int MaximumMessageBytes = 65536;
 
         private readonly object _gate = new object();
         private readonly int _port;
@@ -2644,6 +3587,9 @@ namespace QuickSearchFloat
         private bool _disposed;
 
         public event Action<bool> ConnectionChanged;
+        public event Action<string, InlineSearchResult> ResultReceived;
+        public event Action<string, bool> BatchCompleted;
+        public event Action<string, string> SearchFailed;
 
         public EdgeExtensionBridge(int port)
         {
@@ -2679,6 +3625,12 @@ namespace QuickSearchFloat
 
         public async Task<string> SearchAsync(string url, int timeoutSeconds)
         {
+            return await SearchAsync(url, timeoutSeconds, null);
+        }
+
+        public async Task<string> SearchAsync(string url, int timeoutSeconds,
+            Action<string> requestStarted)
+        {
             Uri uri;
             if (!Uri.TryCreate(url, UriKind.Absolute, out uri) ||
                 (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
@@ -2688,6 +3640,8 @@ namespace QuickSearchFloat
             TaskCompletionSource<string> completion = new TaskCompletionSource<string>();
             lock (_gate)
                 _ready.Add(requestId, completion);
+            if (requestStarted != null)
+                requestStarted(requestId);
 
             try
             {
@@ -2711,12 +3665,25 @@ namespace QuickSearchFloat
 
         public async Task ShowAsync(string requestId, int timeoutSeconds)
         {
+            await ShowAsync(requestId, null, timeoutSeconds);
+        }
+
+        public async Task ShowAsync(string requestId, string targetUrl, int timeoutSeconds)
+        {
+            if (!string.IsNullOrWhiteSpace(targetUrl))
+            {
+                Uri uri;
+                if (!Uri.TryCreate(targetUrl, UriKind.Absolute, out uri) ||
+                    (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+                    throw new ArgumentException("结果地址无效。", "targetUrl");
+            }
             TaskCompletionSource<bool> completion = new TaskCompletionSource<bool>();
             lock (_gate)
                 _shown[requestId] = completion;
             try
             {
-                await SendTextAsync("show\t" + requestId);
+                await SendTextAsync("show\t" + requestId + "\t" +
+                    EncodeField(targetUrl));
                 await WaitWithTimeout(completion.Task, timeoutSeconds, "Edge 未响应");
             }
             finally
@@ -2724,6 +3691,13 @@ namespace QuickSearchFloat
                 lock (_gate)
                     _shown.Remove(requestId);
             }
+        }
+
+        public Task LoadMoreAsync(string requestId)
+        {
+            if (string.IsNullOrWhiteSpace(requestId))
+                throw new ArgumentException("搜索请求编号不能为空。", "requestId");
+            return SendTextAsync("more\t" + requestId);
         }
 
         public async Task CancelAsync(string requestId)
@@ -2823,7 +3797,7 @@ namespace QuickSearchFloat
 
         private void HandleMessage(string message)
         {
-            string[] parts = message.Split(new[] { '\t' }, 3);
+            string[] parts = message.Split('\t');
             if (parts.Length == 0)
                 return;
             if (parts[0] == "ping")
@@ -2836,6 +3810,30 @@ namespace QuickSearchFloat
             }
             if (parts.Length < 2)
                 return;
+
+            if (parts[0] == "result" && parts.Length >= 7)
+            {
+                try
+                {
+                    string url = DecodeField(parts[3]);
+                    Uri uri;
+                    if (!Uri.TryCreate(url, UriKind.Absolute, out uri) ||
+                        (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+                        return;
+                    RaiseResultReceived(parts[1], new InlineSearchResult(
+                        parts[2] == "ai" ? "ai" : "web",
+                        url, DecodeField(parts[4]), DecodeField(parts[5]),
+                        DecodeField(parts[6])));
+                }
+                catch (UriFormatException) { }
+                return;
+            }
+            if (parts[0] == "batch" && parts.Length >= 3)
+            {
+                RaiseBatchCompleted(parts[1],
+                    string.Equals(parts[2], "true", StringComparison.OrdinalIgnoreCase));
+                return;
+            }
 
             TaskCompletionSource<string> readyCompletion = null;
             TaskCompletionSource<bool> shownCompletion = null;
@@ -2866,7 +3864,39 @@ namespace QuickSearchFloat
                     readyCompletion.TrySetException(error);
                 if (shownCompletion != null)
                     shownCompletion.TrySetException(error);
+                RaiseSearchFailed(parts[1], detail);
             }
+        }
+
+        private static string EncodeField(string value)
+        {
+            return Uri.EscapeDataString(value ?? "");
+        }
+
+        private static string DecodeField(string value)
+        {
+            return Uri.UnescapeDataString(value ?? "");
+        }
+
+        private void RaiseResultReceived(string requestId, InlineSearchResult result)
+        {
+            Action<string, InlineSearchResult> handler = ResultReceived;
+            if (handler != null)
+                handler(requestId, result);
+        }
+
+        private void RaiseBatchCompleted(string requestId, bool hasMore)
+        {
+            Action<string, bool> handler = BatchCompleted;
+            if (handler != null)
+                handler(requestId, hasMore);
+        }
+
+        private void RaiseSearchFailed(string requestId, string detail)
+        {
+            Action<string, string> handler = SearchFailed;
+            if (handler != null)
+                handler(requestId, detail);
         }
 
         private async Task SendTextAsync(string message)
