@@ -21,6 +21,7 @@ using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Effects;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using Forms = System.Windows.Forms;
 using Drawing = System.Drawing;
 
@@ -46,7 +47,7 @@ namespace QuickSearchFloat
             {
                 if (!created)
                 {
-                    MessageBox.Show("快捷搜索已经在运行，请按 Ctrl+Alt+Space 唤出。", "快捷搜索",
+                    MessageBox.Show("快捷搜索已经在运行，请按 " + settings.Hotkey + " 唤出。", "快捷搜索",
                         MessageBoxButton.OK, MessageBoxImage.Information);
                     return 0;
                 }
@@ -85,6 +86,67 @@ namespace QuickSearchFloat
                 if (!settings.DarkBackgroundColor.StartsWith("#") ||
                     !settings.LightBackgroundColor.StartsWith("#"))
                     throw new InvalidOperationException("背景颜色配置无效。");
+                uint testModifiers;
+                uint testVirtualKey;
+                string testHotkey;
+                if (!SearchSettings.TryParseHotkey("Control + Space", out testModifiers,
+                    out testVirtualKey, out testHotkey) || testHotkey != "Ctrl+Space")
+                    throw new InvalidOperationException("快捷键解析检查失败。");
+                if (SearchSettings.TryParseHotkey("Space", out testModifiers,
+                    out testVirtualKey, out testHotkey))
+                    throw new InvalidOperationException("快捷键修饰键检查失败。");
+                if (SearchSettings.NormalizeDynamicBlurFps(30) != 30 ||
+                    SearchSettings.NormalizeDynamicBlurFps(59) != 10)
+                    throw new InvalidOperationException("动态模糊帧率档位检查失败。");
+                if (StartupManager.BuildCommand(@"C:\Program Files\Quick Search\app.exe") !=
+                    "\"C:\\Program Files\\Quick Search\\app.exe\"")
+                    throw new InvalidOperationException("开机启动命令检查失败。");
+                if (!SearchSettings.IsValidEngineTemplate(
+                        "https://example.test/search?q={query}") ||
+                    SearchSettings.IsValidEngineTemplate("javascript:{query}"))
+                    throw new InvalidOperationException("搜索引擎地址检查失败。");
+                string settingsTestPath = Path.Combine(appDirectory,
+                    ".quick-search-settings-test-" + Guid.NewGuid().ToString("N") + ".ini");
+                try
+                {
+                    File.WriteAllText(settingsTestPath,
+                        "selected=One\r\nhotkey=Ctrl+Space\r\n" +
+                        "One=https://one.example/search?q={query}\r\n",
+                        new UTF8Encoding(false));
+                    SearchSettings editable = SearchSettings.Load(settingsTestPath);
+                    editable.SaveGeneral(0, 40, "#112233", "#F0F0F0", "Ctrl+Shift+K",
+                        true, 60);
+                    bool rejectedReservedName = false;
+                    try
+                    {
+                        editable.SaveEngines(new List<SearchEngine>
+                        {
+                            new SearchEngine("hotkey", "https://example.test/?q={query}")
+                        }, "hotkey");
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        rejectedReservedName = true;
+                    }
+                    if (!rejectedReservedName)
+                        throw new InvalidOperationException("保留设置名称检查失败。");
+                    editable.SaveEngines(new List<SearchEngine>
+                    {
+                        new SearchEngine("One", "https://one.example/search?q={query}"),
+                        new SearchEngine("Two", "https://two.example/find/{query}")
+                    }, "Two");
+                    SearchSettings reloaded = SearchSettings.Load(settingsTestPath);
+                    if (reloaded.Hotkey != "Ctrl+Shift+K" ||
+                        reloaded.BackgroundOpacity != 0 || reloaded.BlurRadius != 40 ||
+                        !reloaded.DynamicBlur || reloaded.DynamicBlurFps != 60 ||
+                        reloaded.Engines.Count != 2 || reloaded.SelectedName != "Two")
+                        throw new InvalidOperationException("设置保存与重新加载检查失败。");
+                }
+                finally
+                {
+                    if (File.Exists(settingsTestPath))
+                        File.Delete(settingsTestPath);
+                }
 
                 string encoded = SearchHelper.BuildSearchUrl(
                     "空 格", "https://example.test/search?q={query}");
@@ -114,6 +176,10 @@ namespace QuickSearchFloat
                     "\r\nBrowser=" + browser +
                     "\r\nOpacity=" + settings.BackgroundOpacity +
                     "\r\nBlurRadius=" + settings.BlurRadius +
+                    "\r\nHotkey=" + settings.Hotkey +
+                    "\r\nDynamicBlur=" + settings.DynamicBlur +
+                    "\r\nDynamicBlurFps=" + settings.DynamicBlurFps +
+                    "\r\nSettingsPersistence=OK" +
                     "\r\nExtension=Ready\r\nBridgeProtocol=OK\r\n",
                     new UTF8Encoding(false));
                 return 0;
@@ -244,6 +310,9 @@ namespace QuickSearchFloat
         public int BlurRadius { get; private set; }
         public string DarkBackgroundColor { get; private set; }
         public string LightBackgroundColor { get; private set; }
+        public string Hotkey { get; private set; }
+        public bool DynamicBlur { get; private set; }
+        public int DynamicBlurFps { get; private set; }
 
         private SearchSettings(string filePath)
         {
@@ -253,6 +322,9 @@ namespace QuickSearchFloat
             BlurRadius = 18;
             DarkBackgroundColor = "#1C2027";
             LightBackgroundColor = "#FFFFFF";
+            Hotkey = "Ctrl+Space";
+            DynamicBlur = false;
+            DynamicBlurFps = 10;
         }
 
         public static SearchSettings Load(string filePath)
@@ -303,11 +375,31 @@ namespace QuickSearchFloat
                             settings.LightBackgroundColor = value.ToUpperInvariant();
                         continue;
                     }
+                    if (string.Equals(name, "hotkey", StringComparison.OrdinalIgnoreCase))
+                    {
+                        uint modifiers;
+                        uint virtualKey;
+                        string normalized;
+                        if (TryParseHotkey(value, out modifiers, out virtualKey, out normalized))
+                            settings.Hotkey = normalized;
+                        continue;
+                    }
+                    if (string.Equals(name, "dynamicBlur", StringComparison.OrdinalIgnoreCase))
+                    {
+                        bool dynamicBlur;
+                        if (bool.TryParse(value, out dynamicBlur))
+                            settings.DynamicBlur = dynamicBlur;
+                        continue;
+                    }
+                    if (string.Equals(name, "dynamicBlurFps", StringComparison.OrdinalIgnoreCase))
+                    {
+                        int fps;
+                        if (int.TryParse(value, out fps))
+                            settings.DynamicBlurFps = NormalizeDynamicBlurFps(fps);
+                        continue;
+                    }
 
-                    Uri uri;
-                    string sample = value.Replace("{query}", "test");
-                    if (value.Contains("{query}") && Uri.TryCreate(sample, UriKind.Absolute, out uri) &&
-                        (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
+                    if (IsValidEngineTemplate(value))
                         settings.Engines.Add(new SearchEngine(name, value));
                 }
             }
@@ -338,12 +430,22 @@ namespace QuickSearchFloat
             File.WriteAllLines(FilePath, lines, new UTF8Encoding(false));
         }
 
-        public void SaveAppearance(int opacity, int blurRadius, string darkColor, string lightColor)
+        public void SaveGeneral(int opacity, int blurRadius, string darkColor, string lightColor,
+            string hotkey, bool dynamicBlur, int dynamicBlurFps)
         {
+            uint modifiers;
+            uint virtualKey;
+            string normalizedHotkey;
+            if (!TryParseHotkey(hotkey, out modifiers, out virtualKey, out normalizedHotkey))
+                throw new InvalidOperationException("快捷键必须包含至少一个修饰键和一个按键。");
+
             BackgroundOpacity = NormalizeOpacity(opacity);
             BlurRadius = NormalizeBlur(blurRadius);
             DarkBackgroundColor = IsRgbColor(darkColor) ? darkColor.ToUpperInvariant() : "#1C2027";
             LightBackgroundColor = IsRgbColor(lightColor) ? lightColor.ToUpperInvariant() : "#FFFFFF";
+            Hotkey = normalizedHotkey;
+            DynamicBlur = dynamicBlur;
+            DynamicBlurFps = NormalizeDynamicBlurFps(dynamicBlurFps);
 
             List<string> lines = File.Exists(FilePath)
                 ? File.ReadAllLines(FilePath, Encoding.UTF8).ToList()
@@ -352,7 +454,38 @@ namespace QuickSearchFloat
             Upsert(lines, "blurRadius", BlurRadius.ToString(CultureInfo.InvariantCulture));
             Upsert(lines, "darkColor", DarkBackgroundColor);
             Upsert(lines, "lightColor", LightBackgroundColor);
+            Upsert(lines, "hotkey", Hotkey);
+            Upsert(lines, "dynamicBlur", DynamicBlur ? "true" : "false");
+            Upsert(lines, "dynamicBlurFps",
+                DynamicBlurFps.ToString(CultureInfo.InvariantCulture));
             File.WriteAllLines(FilePath, lines, new UTF8Encoding(false));
+        }
+
+        public void SaveEngines(List<SearchEngine> engines, string selectedName)
+        {
+            if (engines == null || engines.Count == 0)
+                throw new InvalidOperationException("至少保留一个搜索引擎。");
+            if (engines.Any(engine => string.IsNullOrWhiteSpace(engine.Name) ||
+                engine.Name.Contains("=") || IsReservedSettingName(engine.Name) ||
+                !IsValidEngineTemplate(engine.Template)))
+                throw new InvalidOperationException("搜索引擎名称或地址无效。");
+            if (engines.Select(engine => engine.Name).Distinct(StringComparer.OrdinalIgnoreCase).Count()
+                != engines.Count)
+                throw new InvalidOperationException("搜索引擎名称不能重复。");
+            if (!engines.Any(engine => engine.Name == selectedName))
+                selectedName = engines[0].Name;
+
+            List<string> lines = File.Exists(FilePath)
+                ? File.ReadAllLines(FilePath, Encoding.UTF8).ToList()
+                : new List<string>();
+            lines.RemoveAll(IsEngineLine);
+            Upsert(lines, "selected", selectedName);
+            foreach (SearchEngine engine in engines)
+                lines.Add(engine.Name + "=" + engine.Template);
+            File.WriteAllLines(FilePath, lines, new UTF8Encoding(false));
+
+            Engines = engines;
+            SelectedName = selectedName;
         }
 
         private static void Upsert(List<string> lines, string name, string value)
@@ -375,6 +508,137 @@ namespace QuickSearchFloat
             return Math.Max(0, Math.Min(40, blurRadius));
         }
 
+        public static int NormalizeDynamicBlurFps(int fps)
+        {
+            return fps == 30 || fps == 60 ? fps : 10;
+        }
+
+        public static bool TryParseHotkey(string value, out uint modifiers, out uint virtualKey,
+            out string normalized)
+        {
+            modifiers = 0;
+            virtualKey = 0;
+            normalized = null;
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            Key key = Key.None;
+            foreach (string rawToken in value.Split('+'))
+            {
+                string token = rawToken.Trim();
+                switch (token.ToLowerInvariant())
+                {
+                    case "ctrl":
+                    case "control":
+                        modifiers |= (uint)ModifierKeys.Control;
+                        continue;
+                    case "alt":
+                        modifiers |= (uint)ModifierKeys.Alt;
+                        continue;
+                    case "shift":
+                        modifiers |= (uint)ModifierKeys.Shift;
+                        continue;
+                    case "win":
+                    case "windows":
+                        modifiers |= (uint)ModifierKeys.Windows;
+                        continue;
+                    case "enter":
+                        key = Key.Return;
+                        continue;
+                    case "esc":
+                        key = Key.Escape;
+                        continue;
+                }
+
+                Key parsedKey;
+                if (token.Length == 1 && char.IsLetter(token[0]))
+                    parsedKey = (Key)Enum.Parse(typeof(Key), token.ToUpperInvariant());
+                else if (token.Length == 1 && char.IsDigit(token[0]))
+                    parsedKey = (Key)((int)Key.D0 + (token[0] - '0'));
+                else if (!Enum.TryParse(token, true, out parsedKey))
+                    return false;
+                if (key != Key.None)
+                    return false;
+                key = parsedKey;
+            }
+
+            if (modifiers == 0 || IsModifierKey(key))
+                return false;
+            virtualKey = (uint)KeyInterop.VirtualKeyFromKey(key);
+            if (virtualKey == 0)
+                return false;
+            normalized = FormatHotkey((ModifierKeys)modifiers, key);
+            return true;
+        }
+
+        public static bool TryFormatHotkey(ModifierKeys modifiers, Key key, out string normalized)
+        {
+            normalized = null;
+            modifiers &= ModifierKeys.Control | ModifierKeys.Alt |
+                ModifierKeys.Shift | ModifierKeys.Windows;
+            if (modifiers == ModifierKeys.None || IsModifierKey(key))
+                return false;
+            normalized = FormatHotkey(modifiers, key);
+            return true;
+        }
+
+        public static bool IsValidEngineTemplate(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value) || !value.Contains("{query}"))
+                return false;
+            Uri uri;
+            string sample = value.Replace("{query}", "test");
+            return Uri.TryCreate(sample, UriKind.Absolute, out uri) &&
+                (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps);
+        }
+
+        private static bool IsEngineLine(string raw)
+        {
+            string line = raw.Trim();
+            int separator = line.IndexOf('=');
+            return separator > 0 && IsValidEngineTemplate(line.Substring(separator + 1).Trim());
+        }
+
+        private static bool IsReservedSettingName(string name)
+        {
+            return string.Equals(name, "selected", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(name, "opacity", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(name, "blurRadius", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(name, "darkColor", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(name, "lightColor", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(name, "hotkey", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(name, "dynamicBlur", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(name, "dynamicBlurFps", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsModifierKey(Key key)
+        {
+            return key == Key.None || key == Key.LeftCtrl || key == Key.RightCtrl ||
+                key == Key.LeftAlt || key == Key.RightAlt || key == Key.LeftShift ||
+                key == Key.RightShift || key == Key.LWin || key == Key.RWin;
+        }
+
+        private static string FormatHotkey(ModifierKeys modifiers, Key key)
+        {
+            List<string> parts = new List<string>();
+            if ((modifiers & ModifierKeys.Control) != 0) parts.Add("Ctrl");
+            if ((modifiers & ModifierKeys.Alt) != 0) parts.Add("Alt");
+            if ((modifiers & ModifierKeys.Shift) != 0) parts.Add("Shift");
+            if ((modifiers & ModifierKeys.Windows) != 0) parts.Add("Win");
+
+            string keyName;
+            if (key >= Key.D0 && key <= Key.D9)
+                keyName = ((int)(key - Key.D0)).ToString(CultureInfo.InvariantCulture);
+            else if (key == Key.Return)
+                keyName = "Enter";
+            else if (key == Key.Escape)
+                keyName = "Esc";
+            else
+                keyName = key.ToString();
+            parts.Add(keyName);
+            return string.Join("+", parts);
+        }
+
         private static bool IsRgbColor(string value)
         {
             int parsed;
@@ -384,12 +648,42 @@ namespace QuickSearchFloat
         }
     }
 
+    internal static class StartupManager
+    {
+        private const string RunKeyPath =
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+        private const string ValueName = "QuickSearchFloat";
+
+        public static bool IsEnabled(string executablePath)
+        {
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKeyPath))
+            {
+                string command = key == null ? null : key.GetValue(ValueName) as string;
+                return string.Equals(command, BuildCommand(executablePath),
+                    StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        public static void SetEnabled(string executablePath, bool enabled)
+        {
+            using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RunKeyPath))
+            {
+                if (enabled)
+                    key.SetValue(ValueName, BuildCommand(executablePath), RegistryValueKind.String);
+                else
+                    key.DeleteValue(ValueName, false);
+            }
+        }
+
+        public static string BuildCommand(string executablePath)
+        {
+            return "\"" + Path.GetFullPath(executablePath) + "\"";
+        }
+    }
+
     internal sealed class MainWindow : Window
     {
         private const int HotkeyId = 0x5153;
-        private const uint ModAlt = 0x0001;
-        private const uint ModControl = 0x0002;
-        private const uint VirtualKeySpace = 0x20;
 
         private SearchSettings _settings;
         private readonly TextBox _queryBox;
@@ -405,6 +699,8 @@ namespace QuickSearchFloat
         private readonly System.Windows.Shapes.Path _searchGlyph;
         private readonly Forms.NotifyIcon _trayIcon;
         private readonly EdgeExtensionBridge _bridge;
+        private readonly DispatcherTimer _dynamicBlurTimer;
+        private readonly Drawing.Icon _appIcon;
         private readonly bool _preview;
         private readonly bool _appearancePreview;
         private HwndSource _source;
@@ -418,6 +714,11 @@ namespace QuickSearchFloat
         private bool _readyToOpen;
         private bool _exiting;
         private int _focusGuardCount;
+        private uint _registeredHotkeyModifiers;
+        private uint _registeredHotkeyKey;
+        private bool _hotkeyRegistered;
+        private bool _dynamicCaptureSupported = true;
+        private bool _captureAffinityApplied;
 
         public MainWindow(SearchSettings settings, bool preview, bool appearancePreview)
         {
@@ -434,6 +735,21 @@ namespace QuickSearchFloat
             ShowInTaskbar = preview;
             Topmost = true;
             FontFamily = new FontFamily("Segoe UI Variable Text, Microsoft YaHei UI");
+            _appIcon = Drawing.Icon.ExtractAssociatedIcon(
+                Process.GetCurrentProcess().MainModule.FileName);
+            if (_appIcon != null)
+                Icon = Imaging.CreateBitmapSourceFromHIcon(_appIcon.Handle,
+                    Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
+
+            _dynamicBlurTimer = new DispatcherTimer(DispatcherPriority.Render);
+            _dynamicBlurTimer.Tick += delegate
+            {
+                if (_settings.DynamicBlur && _settings.BlurRadius > 0 &&
+                    IsVisible && _dynamicCaptureSupported)
+                    RefreshBackdrop();
+                else
+                    ConfigureDynamicBlurTimer();
+            };
 
             _bridge = new EdgeExtensionBridge(EdgeExtensionBridge.DefaultPort);
             _bridge.ConnectionChanged += BridgeOnConnectionChanged;
@@ -581,18 +897,20 @@ namespace QuickSearchFloat
             LoadEngines();
 
             _trayIcon = new Forms.NotifyIcon();
-            _trayIcon.Icon = Drawing.SystemIcons.Information;
+            _trayIcon.Icon = _appIcon ?? Drawing.SystemIcons.Application;
             _trayIcon.Text = "快捷搜索";
             _trayIcon.Visible = true;
             Forms.ContextMenuStrip menu = new Forms.ContextMenuStrip();
             menu.Items.Add("打开搜索", null, delegate { Dispatcher.BeginInvoke(new Action(ShowSearch)); });
-            menu.Items.Add("编辑搜索引擎", null, delegate { Dispatcher.BeginInvoke(new Action(EditSettings)); });
+            menu.Items.Add("搜索引擎", null,
+                delegate { Dispatcher.BeginInvoke(new Action(EditSearchEngines)); });
             menu.Items.Add(new Forms.ToolStripSeparator());
             menu.Items.Add("退出", null, delegate { Dispatcher.BeginInvoke(new Action(ExitApplication)); });
             _trayIcon.ContextMenuStrip = menu;
             _trayIcon.DoubleClick += delegate { Dispatcher.BeginInvoke(new Action(ShowSearch)); };
 
             SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
+            IsVisibleChanged += delegate { ConfigureDynamicBlurTimer(); };
             SourceInitialized += OnSourceInitialized;
             Loaded += delegate
             {
@@ -605,7 +923,7 @@ namespace QuickSearchFloat
                 else
                     SetStatus("正在等待 Edge 扩展连接…", "#FFB54708", false);
                 if (_appearancePreview)
-                    Dispatcher.BeginInvoke(new Action(EditAppearance));
+                    Dispatcher.BeginInvoke(new Action(EditGeneralSettings));
             };
             Closing += delegate(object sender, System.ComponentModel.CancelEventArgs e)
             {
@@ -644,12 +962,13 @@ namespace QuickSearchFloat
             };
         }
 
-        private static ControlTemplate CreateGlassButtonTemplate(bool surfaceFeedback)
+        private static ControlTemplate CreateGlassButtonTemplate(bool surfaceFeedback,
+            double cornerRadius = 24)
         {
             ControlTemplate template = new ControlTemplate(typeof(Button));
             FrameworkElementFactory surface = new FrameworkElementFactory(typeof(Border));
             surface.Name = "Surface";
-            surface.SetValue(Border.CornerRadiusProperty, new CornerRadius(24));
+            surface.SetValue(Border.CornerRadiusProperty, new CornerRadius(cornerRadius));
             surface.SetBinding(Border.BackgroundProperty, new Binding("Background")
             {
                 RelativeSource = RelativeSource.TemplatedParent
@@ -744,7 +1063,47 @@ namespace QuickSearchFloat
             _backdropBlur.Radius = _settings.BlurRadius;
             _backdropImage.Visibility = _settings.BlurRadius > 0
                 ? Visibility.Visible : Visibility.Collapsed;
+            ConfigureDynamicBlurTimer();
+        }
 
+        private void ConfigureDynamicBlurTimer()
+        {
+            _dynamicBlurTimer.Interval = TimeSpan.FromSeconds(
+                1.0 / SearchSettings.NormalizeDynamicBlurFps(_settings.DynamicBlurFps));
+            bool shouldRun = _settings.DynamicBlur && _settings.BlurRadius > 0 &&
+                IsVisible && _source != null && _dynamicCaptureSupported;
+            if (shouldRun)
+            {
+                if (!_captureAffinityApplied)
+                {
+                    // ponytail: 窗口可见期间持续排除自身，避免动态取样递归叠亮。
+                    if (!NativeMethods.SetWindowDisplayAffinity(
+                        new WindowInteropHelper(this).Handle,
+                        NativeMethods.WdaExcludeFromCapture))
+                    {
+                        _dynamicCaptureSupported = false;
+                        _dynamicBlurTimer.Stop();
+                        return;
+                    }
+                    _captureAffinityApplied = true;
+                    NativeMethods.DwmFlush();
+                }
+                _dynamicBlurTimer.Start();
+            }
+            else
+            {
+                _dynamicBlurTimer.Stop();
+                RestoreCaptureAffinity();
+            }
+        }
+
+        private void RestoreCaptureAffinity()
+        {
+            if (!_captureAffinityApplied)
+                return;
+            NativeMethods.SetWindowDisplayAffinity(
+                new WindowInteropHelper(this).Handle, NativeMethods.WdaNone);
+            _captureAffinityApplied = false;
         }
 
         private static bool IsDarkTheme()
@@ -794,16 +1153,12 @@ namespace QuickSearchFloat
         private void OpenSettingsMenu(object sender, RoutedEventArgs e)
         {
             ContextMenu menu = CreateGlassMenu(_settingsButton);
-            MenuItem appearance = new MenuItem { Header = "外观设置…" };
-            appearance.Click += delegate { EditAppearance(); };
-            MenuItem edit = new MenuItem { Header = "编辑搜索引擎…" };
-            edit.Click += delegate { EditSettings(); };
-            MenuItem reload = new MenuItem { Header = "重新加载配置" };
-            reload.Click += delegate { ReloadSettings(); };
+            MenuItem appearance = new MenuItem { Header = "通用设置" };
+            appearance.Click += delegate { EditGeneralSettings(); };
+            MenuItem edit = new MenuItem { Header = "搜索引擎" };
+            edit.Click += delegate { EditSearchEngines(); };
             menu.Items.Add(appearance);
-            menu.Items.Add(new Separator());
             menu.Items.Add(edit);
-            menu.Items.Add(reload);
             OpenGuardedMenu(menu);
         }
 
@@ -821,7 +1176,6 @@ namespace QuickSearchFloat
                 Template = CreateGlassMenuTemplate()
             };
             menu.Resources[typeof(MenuItem)] = CreateGlassMenuItemStyle();
-            menu.Resources[typeof(Separator)] = CreateGlassSeparatorStyle();
             return menu;
         }
 
@@ -903,20 +1257,6 @@ namespace QuickSearchFloat
             return style;
         }
 
-        private Style CreateGlassSeparatorStyle()
-        {
-            Style style = new Style(typeof(Separator));
-            ControlTemplate template = new ControlTemplate(typeof(Separator));
-            FrameworkElementFactory line = new FrameworkElementFactory(typeof(Border));
-            line.SetValue(Border.HeightProperty, 1.0);
-            line.SetValue(Border.MarginProperty, new Thickness(12, 6, 12, 6));
-            line.SetValue(Border.BackgroundProperty,
-                Brush(_isDark ? "#24FFFFFF" : "#220B1220"));
-            template.VisualTree = line;
-            style.Setters.Add(new Setter(Separator.TemplateProperty, template));
-            return style;
-        }
-
         private void OpenGuardedMenu(ContextMenu menu)
         {
             _focusGuardCount++;
@@ -968,8 +1308,94 @@ namespace QuickSearchFloat
             PositionWindow();
             RefreshBackdrop();
             ApplyTheme();
-            if (!NativeMethods.RegisterHotKey(handle, HotkeyId, ModControl | ModAlt, VirtualKeySpace))
-                SetStatus("Ctrl+Alt+Space 已被占用，可从托盘打开", "#FFB54708", false);
+            string error;
+            if (!RegisterConfiguredHotkey(_settings.Hotkey, out error))
+                SetStatus(error + "，可从托盘打开", "#FFB54708", false);
+        }
+
+        private bool RegisterConfiguredHotkey(string hotkey, out string error)
+        {
+            uint modifiers;
+            uint virtualKey;
+            string normalized;
+            if (!SearchSettings.TryParseHotkey(hotkey, out modifiers, out virtualKey,
+                out normalized))
+            {
+                error = "快捷键格式无效";
+                return false;
+            }
+
+            IntPtr handle = new WindowInteropHelper(this).Handle;
+            if (!NativeMethods.RegisterHotKey(handle, HotkeyId, modifiers, virtualKey))
+            {
+                error = normalized + " 已被占用";
+                return false;
+            }
+            _registeredHotkeyModifiers = modifiers;
+            _registeredHotkeyKey = virtualKey;
+            _hotkeyRegistered = true;
+            error = null;
+            return true;
+        }
+
+        private bool TryApplyHotkey(string hotkey, out string error)
+        {
+            uint modifiers;
+            uint virtualKey;
+            string normalized;
+            if (!SearchSettings.TryParseHotkey(hotkey, out modifiers, out virtualKey,
+                out normalized))
+            {
+                error = "快捷键格式无效";
+                return false;
+            }
+            if (_hotkeyRegistered && modifiers == _registeredHotkeyModifiers &&
+                virtualKey == _registeredHotkeyKey)
+            {
+                error = null;
+                return true;
+            }
+
+            uint previousModifiers = _registeredHotkeyModifiers;
+            uint previousKey = _registeredHotkeyKey;
+            bool hadPrevious = _hotkeyRegistered;
+            SuspendConfiguredHotkey();
+            if (NativeMethods.RegisterHotKey(new WindowInteropHelper(this).Handle,
+                HotkeyId, modifiers, virtualKey))
+            {
+                _registeredHotkeyModifiers = modifiers;
+                _registeredHotkeyKey = virtualKey;
+                _hotkeyRegistered = true;
+                error = null;
+                return true;
+            }
+
+            _registeredHotkeyModifiers = previousModifiers;
+            _registeredHotkeyKey = previousKey;
+            if (hadPrevious)
+                ResumeConfiguredHotkey();
+            error = normalized + " 已被占用";
+            return false;
+        }
+
+        private void SuspendConfiguredHotkey()
+        {
+            if (!_hotkeyRegistered)
+                return;
+            NativeMethods.UnregisterHotKey(new WindowInteropHelper(this).Handle, HotkeyId);
+            _hotkeyRegistered = false;
+        }
+
+        private bool ResumeConfiguredHotkey()
+        {
+            if (_hotkeyRegistered)
+                return true;
+            if (_registeredHotkeyModifiers == 0 || _registeredHotkeyKey == 0)
+                return false;
+            _hotkeyRegistered = NativeMethods.RegisterHotKey(
+                new WindowInteropHelper(this).Handle, HotkeyId,
+                _registeredHotkeyModifiers, _registeredHotkeyKey);
+            return _hotkeyRegistered;
         }
 
         private IntPtr WindowProcedure(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
@@ -1254,24 +1680,419 @@ namespace QuickSearchFloat
                 _queryBox, "使用 " + _selectedEngine.Name + " 搜索");
         }
 
-        private void ReloadSettings()
+        private void EditGeneralSettings()
         {
-            _settings = SearchSettings.Load(_settings.FilePath);
-            LoadEngines();
-            ApplyTheme();
-            SetStatus("配置已重新加载", "#FF067647", false);
+            Window dialog = CreateSettingsDialog("通用设置", 430, 466);
+            Grid material = CreateSettingsMaterial();
+            Grid root = new Grid { Margin = new Thickness(18, 14, 18, 14) };
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(42) });
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(56) });
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(56) });
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(48) });
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(48) });
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(48) });
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(46) });
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(54) });
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(40) });
+
+            TextBlock heading = SettingsHeading("通用设置", dialog);
+            root.Children.Add(heading);
+
+            Grid opacityRow = new Grid();
+            opacityRow.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            opacityRow.RowDefinitions.Add(new RowDefinition());
+            Grid opacityHeader = new Grid();
+            opacityHeader.ColumnDefinitions.Add(new ColumnDefinition());
+            opacityHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            TextBlock opacityValue = new TextBlock
+            {
+                Text = _settings.BackgroundOpacity + "%",
+                TextAlignment = TextAlignment.Right,
+                FontWeight = FontWeights.SemiBold
+            };
+            opacityHeader.Children.Add(new TextBlock
+            {
+                Text = "透明度",
+                FontSize = 14,
+                FontWeight = FontWeights.Medium
+            });
+            Grid.SetColumn(opacityValue, 1);
+            opacityHeader.Children.Add(opacityValue);
+            Slider opacitySlider = SettingsSlider(0, 100, _settings.BackgroundOpacity);
+            opacitySlider.ValueChanged += delegate
+            {
+                opacityValue.Text = Math.Round(opacitySlider.Value) + "%";
+            };
+            Grid.SetRow(opacitySlider, 1);
+            System.Windows.Automation.AutomationProperties.SetName(opacitySlider, "背景不透明度");
+            opacityRow.Children.Add(opacityHeader);
+            opacityRow.Children.Add(opacitySlider);
+            root.Children.Add(AppearanceRow(opacityRow, 1));
+
+            Grid blurRow = new Grid();
+            blurRow.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            blurRow.RowDefinitions.Add(new RowDefinition());
+            Grid blurHeader = new Grid();
+            blurHeader.ColumnDefinitions.Add(new ColumnDefinition());
+            blurHeader.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            TextBlock blurValue = new TextBlock
+            {
+                Text = _settings.BlurRadius.ToString(CultureInfo.InvariantCulture),
+                TextAlignment = TextAlignment.Right,
+                FontWeight = FontWeights.SemiBold
+            };
+            blurHeader.Children.Add(new TextBlock
+            {
+                Text = "高斯模糊",
+                FontSize = 14,
+                FontWeight = FontWeights.Medium
+            });
+            Grid.SetColumn(blurValue, 1);
+            blurHeader.Children.Add(blurValue);
+            Slider blurSlider = SettingsSlider(0, 40, _settings.BlurRadius);
+            blurSlider.ValueChanged += delegate
+            {
+                blurValue.Text = Math.Round(blurSlider.Value).ToString(CultureInfo.InvariantCulture);
+            };
+            Grid.SetRow(blurSlider, 1);
+            System.Windows.Automation.AutomationProperties.SetName(blurSlider, "高斯模糊强度");
+            blurRow.Children.Add(blurHeader);
+            blurRow.Children.Add(blurSlider);
+            root.Children.Add(AppearanceRow(blurRow, 2));
+
+            string pendingHotkey = _settings.Hotkey;
+            string hotkeyBeforeCapture = pendingHotkey;
+            bool capturingHotkey = false;
+            bool hotkeySuspended = false;
+            Button hotkeyButton = SettingsValueButton(FormatHotkeyForDisplay(pendingHotkey), 150);
+            hotkeyButton.ToolTip = "点击后按下新的组合键";
+            System.Windows.Automation.AutomationProperties.SetName(hotkeyButton, "设置唤醒快捷键");
+            hotkeyButton.Click += delegate
+            {
+                if (capturingHotkey)
+                    return;
+                hotkeyBeforeCapture = pendingHotkey;
+                capturingHotkey = true;
+                hotkeySuspended = _hotkeyRegistered;
+                SuspendConfiguredHotkey();
+                hotkeyButton.Content = "请按快捷键";
+                hotkeyButton.Focus();
+            };
+            hotkeyButton.PreviewKeyDown += delegate(object sender, KeyEventArgs e)
+            {
+                if (!capturingHotkey)
+                    return;
+                e.Handled = true;
+                Key key = e.Key == Key.System ? e.SystemKey : e.Key;
+                if (key == Key.Escape && Keyboard.Modifiers == ModifierKeys.None)
+                {
+                    pendingHotkey = hotkeyBeforeCapture;
+                    capturingHotkey = false;
+                    hotkeyButton.Content = FormatHotkeyForDisplay(pendingHotkey);
+                    if (hotkeySuspended)
+                        ResumeConfiguredHotkey();
+                    hotkeySuspended = false;
+                    return;
+                }
+
+                string formatted;
+                if (!SearchSettings.TryFormatHotkey(Keyboard.Modifiers, key, out formatted))
+                {
+                    hotkeyButton.Content = "继续按主键";
+                    return;
+                }
+                pendingHotkey = formatted;
+                capturingHotkey = false;
+                hotkeyButton.Content = FormatHotkeyForDisplay(pendingHotkey);
+                if (hotkeySuspended)
+                    ResumeConfiguredHotkey();
+                hotkeySuspended = false;
+            };
+            root.Children.Add(AppearanceRow(
+                AppearanceColorRow("唤醒快捷键", hotkeyButton), 3));
+
+            Button darkColorButton = SettingsValueButton("", 150);
+            SetColorButton(darkColorButton, _settings.DarkBackgroundColor);
+            darkColorButton.Click += delegate { PickColor(darkColorButton, dialog); };
+            root.Children.Add(AppearanceRow(
+                AppearanceColorRow("深色背景", darkColorButton), 4));
+
+            Button lightColorButton = SettingsValueButton("", 150);
+            SetColorButton(lightColorButton, _settings.LightBackgroundColor);
+            lightColorButton.Click += delegate { PickColor(lightColorButton, dialog); };
+            root.Children.Add(AppearanceRow(
+                AppearanceColorRow("浅色背景", lightColorButton), 5));
+
+            string executablePath = Process.GetCurrentProcess().MainModule.FileName;
+            bool previousAutoStart = StartupManager.IsEnabled(executablePath);
+            CheckBox autoStartCheck = SettingsCheckBox(previousAutoStart, "开机自启动");
+            root.Children.Add(AppearanceRow(
+                AppearanceColorRow("开机自启动", autoStartCheck), 6));
+
+            int pendingDynamicBlurFps = _settings.DynamicBlurFps;
+            CheckBox dynamicBlurCheck = SettingsCheckBox(
+                _settings.DynamicBlur, "动态高斯模糊");
+            dynamicBlurCheck.Margin = new Thickness(0, 0, 8, 0);
+            StackPanel dynamicControls = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            dynamicControls.Children.Add(dynamicBlurCheck);
+            Dictionary<int, Button> fpsButtons = new Dictionary<int, Button>();
+            foreach (int fps in new[] { 10, 30, 60 })
+            {
+                Button fpsButton = SettingsFpsButton(fps);
+                fpsButtons.Add(fps, fpsButton);
+                fpsButton.Click += delegate(object sender, RoutedEventArgs e)
+                {
+                    pendingDynamicBlurFps = (int)((Button)sender).Tag;
+                    RefreshFpsButtons(fpsButtons, pendingDynamicBlurFps,
+                        dynamicBlurCheck.IsChecked == true);
+                };
+                dynamicControls.Children.Add(fpsButton);
+            }
+            dynamicBlurCheck.Checked += delegate
+            {
+                RefreshFpsButtons(fpsButtons, pendingDynamicBlurFps, true);
+            };
+            dynamicBlurCheck.Unchecked += delegate
+            {
+                RefreshFpsButtons(fpsButtons, pendingDynamicBlurFps, false);
+            };
+            RefreshFpsButtons(fpsButtons, pendingDynamicBlurFps,
+                dynamicBlurCheck.IsChecked == true);
+            root.Children.Add(AppearanceRow(
+                AppearanceColorRow("动态高斯模糊", dynamicControls), 7));
+
+            StackPanel actions = SettingsActions();
+            Button cancel = SettingsActionButton("取消", false);
+            cancel.IsCancel = true;
+            Button save = SettingsActionButton("保存", true);
+            save.IsDefault = true;
+            save.Click += delegate
+            {
+                if (capturingHotkey)
+                    return;
+                if (hotkeySuspended)
+                {
+                    ResumeConfiguredHotkey();
+                    hotkeySuspended = false;
+                }
+
+                string previousHotkey = _settings.Hotkey;
+                string hotkeyError;
+                if (!TryApplyHotkey(pendingHotkey, out hotkeyError))
+                {
+                    MessageBox.Show(dialog, hotkeyError, "快捷搜索",
+                        MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+                try
+                {
+                    StartupManager.SetEnabled(executablePath,
+                        autoStartCheck.IsChecked == true);
+                    _settings.SaveGeneral((int)Math.Round(opacitySlider.Value),
+                        (int)Math.Round(blurSlider.Value),
+                        (string)darkColorButton.Tag, (string)lightColorButton.Tag,
+                        pendingHotkey, dynamicBlurCheck.IsChecked == true,
+                        pendingDynamicBlurFps);
+                    _dynamicCaptureSupported = true;
+                    ApplyTheme();
+                    dialog.DialogResult = true;
+                }
+                catch (Exception ex)
+                {
+                    try { StartupManager.SetEnabled(executablePath, previousAutoStart); }
+                    catch { }
+                    string ignored;
+                    TryApplyHotkey(previousHotkey, out ignored);
+                    _settings = SearchSettings.Load(_settings.FilePath);
+                    _dynamicCaptureSupported = true;
+                    ApplyTheme();
+                    MessageBox.Show(dialog, "无法保存通用设置：" + ex.Message, "快捷搜索",
+                        MessageBoxButton.OK, MessageBoxImage.Error);
+                }
+            };
+            actions.Children.Add(cancel);
+            actions.Children.Add(save);
+            Grid.SetRow(actions, 8);
+            root.Children.Add(actions);
+            material.Children.Add(root);
+            dialog.Content = material;
+            dialog.Closed += delegate
+            {
+                if (hotkeySuspended)
+                    ResumeConfiguredHotkey();
+            };
+
+            bool saved = ShowSettingsDialog(dialog);
+            if (saved)
+            {
+                Hide();
+                RefreshBackdrop();
+                Show();
+                Activate();
+                _queryBox.Focus();
+            }
         }
 
-        private void EditAppearance()
+        private void EditSearchEngines()
+        {
+            Window dialog = CreateSettingsDialog("搜索引擎", 720, 420);
+            Grid material = CreateSettingsMaterial();
+            Grid root = new Grid { Margin = new Thickness(20, 16, 20, 16) };
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(46) });
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(30) });
+            root.RowDefinitions.Add(new RowDefinition());
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(44) });
+
+            Grid titleRow = new Grid();
+            titleRow.ColumnDefinitions.Add(new ColumnDefinition());
+            titleRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            titleRow.Children.Add(SettingsHeading("搜索引擎", dialog));
+            Button add = SettingsActionButton("添加", false);
+            add.Margin = new Thickness(0, 0, 8, 0);
+            Grid.SetColumn(add, 1);
+            titleRow.Children.Add(add);
+            root.Children.Add(titleRow);
+
+            Grid header = new Grid { Margin = new Thickness(8, 0, 8, 0) };
+            AddEngineColumns(header);
+            header.Children.Add(EngineColumnLabel("默认", 0));
+            header.Children.Add(EngineColumnLabel("名称", 1));
+            header.Children.Add(EngineColumnLabel("搜索地址", 2));
+            Grid.SetRow(header, 1);
+            root.Children.Add(header);
+
+            StackPanel rows = new StackPanel();
+            ScrollViewer scroll = new ScrollViewer
+            {
+                Content = rows,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
+            };
+            Grid.SetRow(scroll, 2);
+            root.Children.Add(scroll);
+
+            List<EngineEditorEntry> entries = new List<EngineEditorEntry>();
+            EngineEditorEntry selectedEntry = null;
+            Action refreshRows = delegate
+            {
+                rows.Children.Clear();
+                foreach (EngineEditorEntry item in entries)
+                {
+                    item.CurrentButton.Content = item == selectedEntry ? "●" : "○";
+                    item.CurrentButton.Foreground = item == selectedEntry
+                        ? Brush(_isDark ? "#FF64D2FF" : "#FF007AFF")
+                        : Brush(_isDark ? "#FF9CA3AF" : "#FF667085");
+                    rows.Children.Add(item.Container);
+                }
+            };
+            Action<EngineEditorEntry> selectEntry = delegate(EngineEditorEntry item)
+            {
+                selectedEntry = item;
+                refreshRows();
+            };
+            Action<EngineEditorEntry, int> moveEntry = delegate(EngineEditorEntry item, int offset)
+            {
+                int oldIndex = entries.IndexOf(item);
+                int newIndex = oldIndex + offset;
+                if (newIndex < 0 || newIndex >= entries.Count)
+                    return;
+                entries.RemoveAt(oldIndex);
+                entries.Insert(newIndex, item);
+                refreshRows();
+            };
+            Action<EngineEditorEntry> removeEntry = delegate(EngineEditorEntry item)
+            {
+                if (entries.Count == 1)
+                {
+                    MessageBox.Show(dialog, "至少保留一个搜索引擎。", "快捷搜索",
+                        MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+                int oldIndex = entries.IndexOf(item);
+                entries.Remove(item);
+                if (selectedEntry == item)
+                    selectedEntry = entries[Math.Min(oldIndex, entries.Count - 1)];
+                refreshRows();
+            };
+
+            foreach (SearchEngine engine in _settings.Engines)
+            {
+                EngineEditorEntry entry = CreateEngineEditorEntry(engine, selectEntry,
+                    moveEntry, removeEntry);
+                entries.Add(entry);
+                if (engine.Name == _settings.SelectedName)
+                    selectedEntry = entry;
+            }
+            if (selectedEntry == null)
+                selectedEntry = entries[0];
+            refreshRows();
+
+            add.Click += delegate
+            {
+                int suffix = 1;
+                string name = "新搜索引擎";
+                while (entries.Any(item => string.Equals(item.NameBox.Text, name,
+                    StringComparison.OrdinalIgnoreCase)))
+                    name = "新搜索引擎 " + ++suffix;
+                SearchEngine engine = new SearchEngine(name,
+                    "https://www.google.com/search?q={query}");
+                EngineEditorEntry entry = CreateEngineEditorEntry(engine, selectEntry,
+                    moveEntry, removeEntry);
+                entries.Add(entry);
+                selectedEntry = entry;
+                refreshRows();
+                entry.NameBox.Focus();
+                entry.NameBox.SelectAll();
+                scroll.ScrollToEnd();
+            };
+
+            StackPanel actions = SettingsActions();
+            Button cancel = SettingsActionButton("取消", false);
+            cancel.IsCancel = true;
+            Button save = SettingsActionButton("保存", true);
+            save.IsDefault = true;
+            save.Click += delegate
+            {
+                try
+                {
+                    List<SearchEngine> engines = entries.Select(item => new SearchEngine(
+                        item.NameBox.Text.Trim(), item.TemplateBox.Text.Trim())).ToList();
+                    int selectedIndex = entries.IndexOf(selectedEntry);
+                    string selectedName = engines[Math.Max(0, selectedIndex)].Name;
+                    _settings.SaveEngines(engines, selectedName);
+                    LoadEngines();
+                    ShowIdleControls();
+                    dialog.DialogResult = true;
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(dialog, ex.Message, "快捷搜索",
+                        MessageBoxButton.OK, MessageBoxImage.Warning);
+                }
+            };
+            actions.Children.Add(cancel);
+            actions.Children.Add(save);
+            Grid.SetRow(actions, 3);
+            root.Children.Add(actions);
+            material.Children.Add(root);
+            dialog.Content = material;
+            ShowSettingsDialog(dialog);
+        }
+
+        private Window CreateSettingsDialog(string title, double width, double height)
         {
             Window dialog = new Window
             {
-                Title = "外观设置",
+                Title = title,
                 Owner = this,
-                Width = 480,
-                Height = 440,
+                Width = width,
+                Height = height,
                 ResizeMode = ResizeMode.NoResize,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                WindowStartupLocation = WindowStartupLocation.Manual,
                 ShowInTaskbar = false,
                 FontFamily = FontFamily,
                 WindowStyle = WindowStyle.None,
@@ -1279,7 +2100,12 @@ namespace QuickSearchFloat
                 Background = Brushes.Transparent,
                 Foreground = Brush(_isDark ? "#FFF5F7FA" : "#FF111827")
             };
+            PositionSettingsDialog(dialog);
+            return dialog;
+        }
 
+        private Grid CreateSettingsMaterial()
+        {
             Grid material = new Grid();
             Color dialogBase = ColorFrom(_isDark
                 ? _settings.DarkBackgroundColor
@@ -1312,233 +2138,387 @@ namespace QuickSearchFloat
                 BorderThickness = new Thickness(1),
                 IsHitTestVisible = false
             });
+            return material;
+        }
 
-            Grid root = new Grid { Margin = new Thickness(22, 18, 22, 18) };
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(72) });
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(72) });
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(72) });
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(62) });
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(62) });
-            root.RowDefinitions.Add(new RowDefinition());
-
-            StackPanel heading = new StackPanel
+        private void PositionSettingsDialog(Window dialog)
+        {
+            Rect area = SystemParameters.WorkArea;
+            double left = area.Left + (area.Width - dialog.Width) / 2;
+            double top = area.Top + (area.Height - dialog.Height) / 2;
+            if (IsVisible)
             {
-                VerticalAlignment = VerticalAlignment.Center,
-                Cursor = Cursors.SizeAll
-            };
-            heading.Children.Add(new TextBlock
-            {
-                Text = "Liquid Glass 外观",
-                FontSize = 20,
-                FontWeight = FontWeights.SemiBold
-            });
-            heading.Children.Add(new TextBlock
-            {
-                Text = "调整玻璃染色、背景颜色与高斯模糊",
-                FontSize = 12,
-                Opacity = 0.62,
-                Margin = new Thickness(0, 5, 0, 0)
-            });
-            heading.MouseLeftButtonDown += delegate(object sender, MouseButtonEventArgs e)
-            {
-                if (e.LeftButton == MouseButtonState.Pressed)
-                    dialog.DragMove();
-            };
-            root.Children.Add(heading);
-
-            Grid opacityRow = new Grid();
-            opacityRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(118) });
-            opacityRow.ColumnDefinitions.Add(new ColumnDefinition());
-            opacityRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(48) });
-            TextBlock opacityLabel = new TextBlock
-            {
-                Text = "背景不透明度",
-                VerticalAlignment = VerticalAlignment.Center
-            };
-            TextBlock opacityHint = new TextBlock
-            {
-                Text = "0% 仍保留环境折射",
-                FontSize = 11,
-                Opacity = 0.62,
-                Margin = new Thickness(0, 3, 0, 0)
-            };
-            StackPanel opacityText = new StackPanel
-            {
-                VerticalAlignment = VerticalAlignment.Center
-            };
-            opacityText.Children.Add(opacityLabel);
-            opacityText.Children.Add(opacityHint);
-            Slider opacitySlider = new Slider
-            {
-                Minimum = 0,
-                Maximum = 100,
-                TickFrequency = 1,
-                IsSnapToTickEnabled = true,
-                Value = _settings.BackgroundOpacity,
-                VerticalAlignment = VerticalAlignment.Center,
-                Foreground = Brush(_isDark ? "#FF64D2FF" : "#FF007AFF")
-            };
-            TextBlock opacityValue = new TextBlock
-            {
-                Text = _settings.BackgroundOpacity + "%",
-                TextAlignment = TextAlignment.Right,
-                VerticalAlignment = VerticalAlignment.Center
-            };
-            opacitySlider.ValueChanged += delegate
-            {
-                opacityValue.Text = Math.Round(opacitySlider.Value) + "%";
-            };
-            Grid.SetColumn(opacitySlider, 1);
-            Grid.SetColumn(opacityValue, 2);
-            System.Windows.Automation.AutomationProperties.SetName(opacitySlider, "背景不透明度");
-            opacityRow.Children.Add(opacityText);
-            opacityRow.Children.Add(opacitySlider);
-            opacityRow.Children.Add(opacityValue);
-            root.Children.Add(AppearanceCard(opacityRow, 1));
-
-            Grid blurRow = new Grid();
-            blurRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(118) });
-            blurRow.ColumnDefinitions.Add(new ColumnDefinition());
-            blurRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(48) });
-            StackPanel blurText = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
-            blurText.Children.Add(new TextBlock
-            {
-                Text = "高斯模糊",
-                VerticalAlignment = VerticalAlignment.Center
-            });
-            blurText.Children.Add(new TextBlock
-            {
-                Text = "0 为关闭，40 为最强",
-                FontSize = 11,
-                Opacity = 0.62,
-                Margin = new Thickness(0, 3, 0, 0)
-            });
-            Slider blurSlider = new Slider
-            {
-                Minimum = 0,
-                Maximum = 40,
-                TickFrequency = 1,
-                IsSnapToTickEnabled = true,
-                Value = _settings.BlurRadius,
-                VerticalAlignment = VerticalAlignment.Center,
-                Foreground = Brush(_isDark ? "#FF64D2FF" : "#FF007AFF")
-            };
-            TextBlock blurValue = new TextBlock
-            {
-                Text = _settings.BlurRadius.ToString(CultureInfo.InvariantCulture),
-                TextAlignment = TextAlignment.Right,
-                VerticalAlignment = VerticalAlignment.Center
-            };
-            blurSlider.ValueChanged += delegate
-            {
-                blurValue.Text = Math.Round(blurSlider.Value).ToString(CultureInfo.InvariantCulture);
-            };
-            Grid.SetColumn(blurSlider, 1);
-            Grid.SetColumn(blurValue, 2);
-            System.Windows.Automation.AutomationProperties.SetName(blurSlider, "高斯模糊强度");
-            blurRow.Children.Add(blurText);
-            blurRow.Children.Add(blurSlider);
-            blurRow.Children.Add(blurValue);
-            root.Children.Add(AppearanceCard(blurRow, 2));
-
-            Button darkColorButton = GlassButton("", 13, false);
-            darkColorButton.Width = 142;
-            darkColorButton.Height = 38;
-            darkColorButton.BorderBrush = Brush(_isDark ? "#36FFFFFF" : "#300B1220");
-            darkColorButton.BorderThickness = new Thickness(1);
-            SetColorButton(darkColorButton, _settings.DarkBackgroundColor);
-            darkColorButton.Click += delegate { PickColor(darkColorButton, dialog); };
-            root.Children.Add(AppearanceCard(
-                AppearanceColorRow("深色模式背景", darkColorButton), 3));
-
-            Button lightColorButton = GlassButton("", 13, false);
-            lightColorButton.Width = 142;
-            lightColorButton.Height = 38;
-            lightColorButton.BorderBrush = Brush(_isDark ? "#36FFFFFF" : "#300B1220");
-            lightColorButton.BorderThickness = new Thickness(1);
-            SetColorButton(lightColorButton, _settings.LightBackgroundColor);
-            lightColorButton.Click += delegate { PickColor(lightColorButton, dialog); };
-            root.Children.Add(AppearanceCard(
-                AppearanceColorRow("浅色模式背景", lightColorButton), 4));
-
-            StackPanel actions = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                HorizontalAlignment = HorizontalAlignment.Right,
-                VerticalAlignment = VerticalAlignment.Bottom
-            };
-            Button cancel = GlassButton("取消", 13, false);
-            cancel.Width = 86;
-            cancel.Height = 38;
-            cancel.Margin = new Thickness(0, 0, 10, 0);
-            cancel.Background = Brush(_isDark ? "#24FFFFFF" : "#7AFFFFFF");
-            cancel.BorderBrush = Brush(_isDark ? "#30FFFFFF" : "#260B1220");
-            cancel.BorderThickness = new Thickness(1);
-            cancel.IsCancel = true;
-            Button save = GlassButton("保存", 13, false);
-            save.Width = 86;
-            save.Height = 38;
-            save.Background = Brush(_isDark ? "#FF0A84FF" : "#FF007AFF");
-            save.Foreground = Brushes.White;
-            save.IsDefault = true;
-            save.Click += delegate
-            {
-                try
+                Rect search = new Rect(Left - 16, Top - 16, Width + 32, Height + 32);
+                Rect settings = new Rect(left, top, dialog.Width, dialog.Height);
+                if (settings.IntersectsWith(search))
                 {
-                    _settings.SaveAppearance((int)Math.Round(opacitySlider.Value),
-                        (int)Math.Round(blurSlider.Value),
-                        (string)darkColorButton.Tag, (string)lightColorButton.Tag);
-                    ApplyTheme();
-                    dialog.DialogResult = true;
+                    double below = Top + Height + 20;
+                    double above = Top - dialog.Height - 20;
+                    if (below + dialog.Height <= area.Bottom)
+                        top = below;
+                    else if (above >= area.Top)
+                        top = above;
+                    else
+                        left = Math.Min(area.Right - dialog.Width,
+                            Math.Max(area.Left, Left + Width + 20));
                 }
-                catch (Exception ex)
-                {
-                    MessageBox.Show(dialog, "无法保存外观设置：" + ex.Message, "快捷搜索",
-                        MessageBoxButton.OK, MessageBoxImage.Error);
-                }
-            };
-            actions.Children.Add(cancel);
-            actions.Children.Add(save);
-            Grid.SetRow(actions, 5);
-            root.Children.Add(actions);
-            material.Children.Add(root);
-            dialog.Content = material;
+            }
+            dialog.Left = Math.Max(area.Left, Math.Min(left, area.Right - dialog.Width));
+            dialog.Top = Math.Max(area.Top, Math.Min(top, area.Bottom - dialog.Height));
+        }
 
+        private bool ShowSettingsDialog(Window dialog)
+        {
             _focusGuardCount++;
-            bool saved = false;
-            try { saved = dialog.ShowDialog() == true; }
+            try { return dialog.ShowDialog() == true; }
             finally
             {
                 _focusGuardCount = Math.Max(0, _focusGuardCount - 1);
                 Dispatcher.BeginInvoke(new Action(HideIfInactive));
             }
-            if (saved)
+        }
+
+        private TextBlock SettingsHeading(string text, Window dialog)
+        {
+            TextBlock heading = new TextBlock
             {
-                Hide();
-                RefreshBackdrop();
-                Show();
-                Activate();
-                _queryBox.Focus();
+                Text = text,
+                FontSize = 19,
+                FontWeight = FontWeights.SemiBold,
+                Margin = new Thickness(8, 0, 0, 0),
+                VerticalAlignment = VerticalAlignment.Center,
+                Cursor = Cursors.SizeAll
+            };
+            heading.MouseLeftButtonDown += delegate(object sender, MouseButtonEventArgs e)
+            {
+                if (e.LeftButton == MouseButtonState.Pressed)
+                    dialog.DragMove();
+            };
+            return heading;
+        }
+
+        private Slider SettingsSlider(double minimum, double maximum, double value)
+        {
+            return new Slider
+            {
+                Minimum = minimum,
+                Maximum = maximum,
+                TickFrequency = 1,
+                IsSnapToTickEnabled = true,
+                Value = value,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, 6, 0, 0),
+                Foreground = Brush(_isDark ? "#FF64D2FF" : "#FF007AFF")
+            };
+        }
+
+        private Button SettingsValueButton(string text, double width)
+        {
+            Button button = GlassButton(text, 13, false);
+            button.Width = width;
+            button.Height = 34;
+            button.HorizontalContentAlignment = HorizontalAlignment.Center;
+            button.VerticalContentAlignment = VerticalAlignment.Center;
+            button.Background = Brush(_isDark ? "#24FFFFFF" : "#7AFFFFFF");
+            button.BorderBrush = Brush(_isDark ? "#36FFFFFF" : "#300B1220");
+            button.BorderThickness = new Thickness(1);
+            button.Foreground = Brush(_isDark ? "#FFF5F7FA" : "#FF111827");
+            button.Template = CreateGlassButtonTemplate(false, 12);
+            return button;
+        }
+
+        private StackPanel SettingsActions()
+        {
+            return new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, 0, 8, 0)
+            };
+        }
+
+        private Button SettingsActionButton(string text, bool primary)
+        {
+            Button button = GlassButton(text, 13, false);
+            button.Width = 80;
+            button.Height = 34;
+            button.Margin = new Thickness(8, 0, 0, 0);
+            button.Background = Brush(primary
+                ? (_isDark ? "#FF0A84FF" : "#FF007AFF")
+                : (_isDark ? "#24FFFFFF" : "#7AFFFFFF"));
+            button.Foreground = primary ? Brushes.White
+                : Brush(_isDark ? "#FFF5F7FA" : "#FF111827");
+            button.BorderBrush = Brush(primary
+                ? "#00000000"
+                : (_isDark ? "#30FFFFFF" : "#260B1220"));
+            button.BorderThickness = new Thickness(1);
+            button.Template = CreateGlassButtonTemplate(false, 12);
+            return button;
+        }
+
+        private CheckBox SettingsCheckBox(bool isChecked, string accessibleName)
+        {
+            CheckBox checkBox = new CheckBox
+            {
+                IsChecked = isChecked,
+                Width = 24,
+                Height = 24,
+                Cursor = Cursors.Hand,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                VerticalAlignment = VerticalAlignment.Center,
+                Template = CreateSettingsCheckBoxTemplate()
+            };
+            System.Windows.Automation.AutomationProperties.SetName(
+                checkBox, accessibleName);
+            return checkBox;
+        }
+
+        private ControlTemplate CreateSettingsCheckBoxTemplate()
+        {
+            ControlTemplate template = new ControlTemplate(typeof(CheckBox));
+            FrameworkElementFactory surface = new FrameworkElementFactory(typeof(Grid));
+
+            FrameworkElementFactory box = new FrameworkElementFactory(typeof(Border));
+            box.Name = "CheckSurface";
+            box.SetValue(FrameworkElement.WidthProperty, 24.0);
+            box.SetValue(FrameworkElement.HeightProperty, 24.0);
+            box.SetValue(Border.CornerRadiusProperty, new CornerRadius(7));
+            box.SetValue(Border.BackgroundProperty,
+                Brush(_isDark ? "#20FFFFFF" : "#66FFFFFF"));
+            box.SetValue(Border.BorderBrushProperty,
+                Brush(_isDark ? "#40FFFFFF" : "#380B1220"));
+            box.SetValue(Border.BorderThicknessProperty, new Thickness(1));
+            surface.AppendChild(box);
+
+            FrameworkElementFactory check = new FrameworkElementFactory(
+                typeof(System.Windows.Shapes.Path));
+            check.Name = "CheckMark";
+            check.SetValue(System.Windows.Shapes.Path.DataProperty,
+                Geometry.Parse("M 5,12 L 10,17 L 19,7"));
+            check.SetValue(System.Windows.Shapes.Shape.StrokeProperty, Brushes.White);
+            check.SetValue(System.Windows.Shapes.Shape.StrokeThicknessProperty, 2.2);
+            check.SetValue(System.Windows.Shapes.Shape.StrokeStartLineCapProperty,
+                PenLineCap.Round);
+            check.SetValue(System.Windows.Shapes.Shape.StrokeEndLineCapProperty,
+                PenLineCap.Round);
+            check.SetValue(UIElement.VisibilityProperty, Visibility.Collapsed);
+            surface.AppendChild(check);
+            template.VisualTree = surface;
+
+            Trigger selected = new Trigger
+            {
+                Property = CheckBox.IsCheckedProperty,
+                Value = true
+            };
+            selected.Setters.Add(new Setter(Border.BackgroundProperty,
+                Brush(_isDark ? "#FF0A84FF" : "#FF007AFF"), "CheckSurface"));
+            selected.Setters.Add(new Setter(Border.BorderBrushProperty,
+                Brush(_isDark ? "#FF64D2FF" : "#FF007AFF"), "CheckSurface"));
+            selected.Setters.Add(new Setter(UIElement.VisibilityProperty,
+                Visibility.Visible, "CheckMark"));
+            template.Triggers.Add(selected);
+
+            Trigger hover = new Trigger
+            {
+                Property = CheckBox.IsMouseOverProperty,
+                Value = true
+            };
+            hover.Setters.Add(new Setter(CheckBox.OpacityProperty, 0.82));
+            template.Triggers.Add(hover);
+            Trigger focus = new Trigger
+            {
+                Property = CheckBox.IsKeyboardFocusedProperty,
+                Value = true
+            };
+            focus.Setters.Add(new Setter(Border.BorderThicknessProperty,
+                new Thickness(2), "CheckSurface"));
+            template.Triggers.Add(focus);
+            return template;
+        }
+
+        private Button SettingsFpsButton(int fps)
+        {
+            Button button = GlassButton(fps.ToString(CultureInfo.InvariantCulture), 12, false);
+            button.Width = 42;
+            button.Height = 30;
+            button.Margin = new Thickness(4, 0, 0, 0);
+            button.Tag = fps;
+            button.BorderThickness = new Thickness(1);
+            button.Template = CreateGlassButtonTemplate(false, 10);
+            System.Windows.Automation.AutomationProperties.SetName(
+                button, fps + " FPS");
+            return button;
+        }
+
+        private void RefreshFpsButtons(Dictionary<int, Button> buttons,
+            int selectedFps, bool enabled)
+        {
+            foreach (KeyValuePair<int, Button> item in buttons)
+            {
+                bool selected = item.Key == selectedFps;
+                item.Value.IsEnabled = enabled;
+                item.Value.Opacity = enabled ? 1 : 0.42;
+                item.Value.Background = Brush(selected
+                    ? (_isDark ? "#FF0A84FF" : "#FF007AFF")
+                    : (_isDark ? "#20FFFFFF" : "#66FFFFFF"));
+                item.Value.Foreground = selected ? Brushes.White
+                    : Brush(_isDark ? "#FFF5F7FA" : "#FF111827");
+                item.Value.BorderBrush = Brush(selected
+                    ? "#00000000"
+                    : (_isDark ? "#30FFFFFF" : "#260B1220"));
             }
         }
 
-        private Border AppearanceCard(UIElement content, int row)
+        private TextBox SettingsTextBox(string text)
         {
-            Border card = new Border
+            TextBox box = new TextBox
             {
-                CornerRadius = new CornerRadius(14),
-                Margin = new Thickness(0, 4, 0, 4),
-                Padding = new Thickness(14, 8, 14, 8),
-                Background = Brush(_isDark ? "#14FFFFFF" : "#4CFFFFFF"),
-                BorderBrush = Brush(_isDark ? "#20FFFFFF" : "#180B1220"),
+                Text = text,
+                FontSize = 13,
+                VerticalContentAlignment = VerticalAlignment.Center,
+                Padding = new Thickness(10, 0, 10, 0),
+                Height = 34,
                 BorderThickness = new Thickness(1),
-                Child = content
+                BorderBrush = Brush(_isDark ? "#30FFFFFF" : "#260B1220"),
+                Background = Brush(_isDark ? "#20FFFFFF" : "#66FFFFFF"),
+                Foreground = Brush(_isDark ? "#FFF5F7FA" : "#FF111827"),
+                SelectionBrush = Brush(_isDark ? "#FF64D2FF" : "#FF007AFF"),
+                Template = CreateSettingsTextBoxTemplate()
             };
-            Grid.SetRow(card, row);
-            return card;
+            return box;
         }
 
-        private static Grid AppearanceColorRow(string label, Button button)
+        private ControlTemplate CreateSettingsTextBoxTemplate()
+        {
+            ControlTemplate template = new ControlTemplate(typeof(TextBox));
+            FrameworkElementFactory surface = new FrameworkElementFactory(typeof(Border));
+            surface.Name = "TextSurface";
+            surface.SetValue(Border.CornerRadiusProperty, new CornerRadius(10));
+            surface.SetValue(Border.BackgroundProperty,
+                new TemplateBindingExtension(Control.BackgroundProperty));
+            surface.SetValue(Border.BorderBrushProperty,
+                new TemplateBindingExtension(Control.BorderBrushProperty));
+            surface.SetValue(Border.BorderThicknessProperty,
+                new TemplateBindingExtension(Control.BorderThicknessProperty));
+            FrameworkElementFactory content = new FrameworkElementFactory(typeof(ScrollViewer));
+            content.Name = "PART_ContentHost";
+            content.SetValue(FrameworkElement.MarginProperty, new Thickness(10, 0, 10, 0));
+            content.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
+            surface.AppendChild(content);
+            template.VisualTree = surface;
+            Trigger focused = new Trigger { Property = TextBox.IsKeyboardFocusedProperty, Value = true };
+            focused.Setters.Add(new Setter(Border.BorderBrushProperty,
+                Brush(_isDark ? "#FF64D2FF" : "#FF007AFF"), "TextSurface"));
+            template.Triggers.Add(focused);
+            return template;
+        }
+
+        private static string FormatHotkeyForDisplay(string hotkey)
+        {
+            return hotkey.Replace("+", " + ");
+        }
+
+        private static void AddEngineColumns(Grid grid)
+        {
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(46) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(134) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition());
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(36) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(36) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(36) });
+        }
+
+        private static TextBlock EngineColumnLabel(string text, int column)
+        {
+            TextBlock label = new TextBlock
+            {
+                Text = text,
+                FontSize = 12,
+                FontWeight = FontWeights.Medium,
+                Opacity = 0.66,
+                Margin = new Thickness(column == 0 ? 0 : 5, 0, 0, 0),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Grid.SetColumn(label, column);
+            return label;
+        }
+
+        private EngineEditorEntry CreateEngineEditorEntry(SearchEngine engine,
+            Action<EngineEditorEntry> select, Action<EngineEditorEntry, int> move,
+            Action<EngineEditorEntry> remove)
+        {
+            EngineEditorEntry entry = new EngineEditorEntry();
+            Grid row = new Grid();
+            AddEngineColumns(row);
+
+            entry.CurrentButton = EngineActionButton("○", "设为默认搜索引擎");
+            entry.CurrentButton.Click += delegate { select(entry); };
+            row.Children.Add(entry.CurrentButton);
+
+            entry.NameBox = SettingsTextBox(engine.Name);
+            entry.NameBox.Margin = new Thickness(4, 0, 4, 0);
+            Grid.SetColumn(entry.NameBox, 1);
+            row.Children.Add(entry.NameBox);
+
+            entry.TemplateBox = SettingsTextBox(engine.Template);
+            entry.TemplateBox.Margin = new Thickness(4, 0, 4, 0);
+            System.Windows.Automation.AutomationProperties.SetName(
+                entry.TemplateBox, engine.Name + " 搜索地址");
+            Grid.SetColumn(entry.TemplateBox, 2);
+            row.Children.Add(entry.TemplateBox);
+
+            Button up = EngineActionButton("↑", "上移");
+            up.Click += delegate { move(entry, -1); };
+            Grid.SetColumn(up, 3);
+            row.Children.Add(up);
+
+            Button down = EngineActionButton("↓", "下移");
+            down.Click += delegate { move(entry, 1); };
+            Grid.SetColumn(down, 4);
+            row.Children.Add(down);
+
+            Button delete = EngineActionButton("×", "删除");
+            delete.Click += delegate { remove(entry); };
+            Grid.SetColumn(delete, 5);
+            row.Children.Add(delete);
+
+            entry.Container = new Border
+            {
+                CornerRadius = new CornerRadius(14),
+                Margin = new Thickness(8, 3, 8, 3),
+                Padding = new Thickness(4),
+                Background = Brush(_isDark ? "#14FFFFFF" : "#3AFFFFFF"),
+                Child = row
+            };
+            return entry;
+        }
+
+        private Button EngineActionButton(string text, string tooltip)
+        {
+            Button button = GlassButton(text, 14, false);
+            button.Width = 30;
+            button.Height = 30;
+            button.Margin = new Thickness(3, 0, 3, 0);
+            button.Background = Brushes.Transparent;
+            button.Foreground = Brush(_isDark ? "#FFF5F7FA" : "#FF111827");
+            button.ToolTip = tooltip;
+            System.Windows.Automation.AutomationProperties.SetName(button, tooltip);
+            return button;
+        }
+
+        private static Border AppearanceRow(UIElement content, int row)
+        {
+            Border container = new Border
+            {
+                Padding = new Thickness(14, 6, 14, 6),
+                Child = content
+            };
+            Grid.SetRow(container, row);
+            return container;
+        }
+
+        private static Grid AppearanceColorRow(string label, FrameworkElement control)
         {
             Grid grid = new Grid();
             grid.ColumnDefinitions.Add(new ColumnDefinition());
@@ -1546,10 +2526,12 @@ namespace QuickSearchFloat
             grid.Children.Add(new TextBlock
             {
                 Text = label,
+                FontSize = 14,
+                FontWeight = FontWeights.Medium,
                 VerticalAlignment = VerticalAlignment.Center
             });
-            Grid.SetColumn(button, 1);
-            grid.Children.Add(button);
+            Grid.SetColumn(control, 1);
+            grid.Children.Add(control);
             return grid;
         }
 
@@ -1578,20 +2560,6 @@ namespace QuickSearchFloat
             }
         }
 
-        private void EditSettings()
-        {
-            try
-            {
-                ProcessStartInfo info = new ProcessStartInfo("notepad.exe", "\"" + _settings.FilePath + "\"");
-                info.UseShellExecute = true;
-                Process.Start(info);
-            }
-            catch (Exception ex)
-            {
-                SetStatus("无法打开配置：" + ex.Message, "#FFD92D20", false);
-            }
-        }
-
         private void ExitApplication()
         {
             _exiting = true;
@@ -1601,13 +2569,16 @@ namespace QuickSearchFloat
 
         private void Cleanup()
         {
-            IntPtr handle = new WindowInteropHelper(this).Handle;
-            NativeMethods.UnregisterHotKey(handle, HotkeyId);
+            _dynamicBlurTimer.Stop();
+            RestoreCaptureAffinity();
+            SuspendConfiguredHotkey();
             if (_source != null)
                 _source.RemoveHook(WindowProcedure);
             SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
             _trayIcon.Visible = false;
             _trayIcon.Dispose();
+            if (_appIcon != null)
+                _appIcon.Dispose();
             _bridge.Dispose();
         }
 
@@ -1619,6 +2590,14 @@ namespace QuickSearchFloat
             {
                 Handle = handle;
             }
+        }
+
+        private sealed class EngineEditorEntry
+        {
+            public Border Container { get; set; }
+            public Button CurrentButton { get; set; }
+            public TextBox NameBox { get; set; }
+            public TextBox TemplateBox { get; set; }
         }
     }
 
@@ -1980,6 +2959,8 @@ namespace QuickSearchFloat
     {
         public const int WmHotkey = 0x0312;
         public const uint AssocStrExecutable = 2;
+        public const uint WdaNone = 0;
+        public const uint WdaExcludeFromCapture = 0x11;
         private const int SwRestore = 9;
 
         private delegate bool EnumWindowsCallback(IntPtr hwnd, IntPtr lParam);
@@ -1989,6 +2970,12 @@ namespace QuickSearchFloat
 
         [DllImport("user32.dll")]
         public static extern bool UnregisterHotKey(IntPtr hwnd, int id);
+
+        [DllImport("user32.dll")]
+        public static extern bool SetWindowDisplayAffinity(IntPtr hwnd, uint affinity);
+
+        [DllImport("dwmapi.dll")]
+        public static extern int DwmFlush();
 
         [DllImport("user32.dll")]
         private static extern bool AllowSetForegroundWindow(uint processId);
